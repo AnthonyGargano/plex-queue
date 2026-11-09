@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,10 +26,10 @@ def _stamp_from_dest(dest: object) -> str | None:
 
 
 def _private(path: Path) -> None:
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
+    from plex_queue.securefs import protect_dir, protect_file
+
+    protect_dir(path.parent)
+    protect_file(path)
 
 
 class Ledger:

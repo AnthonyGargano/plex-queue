@@ -17,6 +17,7 @@ from plex_queue.library import Library
 from plex_queue.plexscan import PlexScan, read_plex_token
 from plex_queue.search import fetch_hits
 from plex_queue.service import Service
+from plex_queue.securefs import protect_dir, protect_file
 from plex_queue.sshutil import ensure_known_host
 from plex_queue.tidy_ledger import TidyLedger
 from plex_queue.vm import ensure_running, guest_reachable
@@ -38,6 +39,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--config", default="config.yaml")
     args = parser.parse_args(argv)
     config = load_config(Path(args.config))
+    protect_dir(config.data_dir)
     if args.command == "check":
         check(config)
         return
@@ -46,6 +48,11 @@ def main(argv: list[str] | None = None) -> None:
         return
     if not config.ready:
         raise SystemExit("Put the Telegram bot token in config.yaml first.")
+    if not config.setup_secret_ready:
+        raise SystemExit(
+            "Choose a private telegram.setup_secret (16+ characters) in config.yaml, "
+            "then restart the bot."
+        )
     _boot(config)
     _pin_host(config)
     library = Library(config.plex_db, list(config.roots))
@@ -69,6 +76,7 @@ def main(argv: list[str] | None = None) -> None:
         tidy_buckets=config.tidy_buckets,
         import_margin=config.import_margin,
         plex_db=config.plex_db,
+        guest_max_active=config.guest_max_active,
     )
     importer = Importer(
         deluge=deluge,
@@ -107,6 +115,10 @@ def tidy_cli(config, argv: list[str] | None = None) -> None:
     """Owner-facing local tidy without Telegram: audit / apply / skip."""
     from plex_queue.access import Access as _Access
 
+    if not config.setup_secret_ready:
+        raise SystemExit(
+            "Choose a private telegram.setup_secret (16+ characters) in config.yaml first."
+        )
     argv = list(argv or [])
     library = Library(config.plex_db, list(config.roots))
     access = _Access(config)
@@ -138,6 +150,7 @@ def tidy_cli(config, argv: list[str] | None = None) -> None:
         tidy_buckets=config.tidy_buckets,
         import_margin=config.import_margin,
         plex_db=config.plex_db,
+        guest_max_active=config.guest_max_active,
     )
     if not argv:
         print(service.tidy(owner, refresh=True))
@@ -176,10 +189,18 @@ def check(config) -> None:
         problems.append("Telegram token is still the placeholder.")
     if not config.deluge_password or config.deluge_password.startswith("PUT_"):
         problems.append("Deluge password is still the placeholder.")
-    if config.setup_secret in {"", "change-this-secret"}:
-        problems.append("Choose a private telegram.setup_secret before starting the bot.")
+    if not config.setup_secret_ready:
+        problems.append(
+            "Choose a private telegram.setup_secret (16+ characters) before starting the bot."
+        )
     if not config.ssh_key.exists():
         problems.append(f"SSH key is missing: {config.ssh_key}")
+    from plex_queue.securefs import is_world_readable
+
+    for relative in ("access.json", "imports.json", "tidy.json", "ssh_known_hosts"):
+        path = config.data_dir / relative
+        if is_world_readable(path):
+            problems.append(f"{path} is world-readable; tighten permissions.")
     if problems:
         print("Deluge was not contacted:")
         for problem in problems:
@@ -215,12 +236,20 @@ def _pin_host(config) -> None:
         config.ssh_known_hosts,
         key=config.ssh_key,
         user=config.ssh_user,
+        allow_tofu=config.ssh_allow_tofu,
     ):
+        protect_file(config.ssh_known_hosts)
         logging.info("SSH host key pinned in %s", config.ssh_known_hosts)
         return
+    hint = (
+        " Or set deluge.ssh.allow_tofu: true for a one-time accept-new pin you will verify."
+        if not config.ssh_allow_tofu
+        else ""
+    )
     raise SystemExit(
         f"Could not pin the SSH host key for {config.ssh_host}. "
-        f"Start the VM and confirm key login works, then restart the bot."
+        f"Start the VM, add a trusted key to {config.ssh_known_hosts} "
+        f"(ssh-keyscan), then restart the bot.{hint}"
     )
 
 

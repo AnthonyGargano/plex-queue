@@ -12,10 +12,10 @@ log = logging.getLogger(__name__)
 
 
 def _private(path: Path) -> None:
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
+    from plex_queue.securefs import protect_dir, protect_file
+
+    protect_dir(path.parent)
+    protect_file(path)
 
 
 class TidyLedger:

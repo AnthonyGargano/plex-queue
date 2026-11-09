@@ -563,21 +563,22 @@ def test_search_hits_are_cached(monkeypatch):
     search_mod._HITS_CACHE.clear()
     calls = []
 
-    class Response:
-        def __enter__(self):
-            return self
+    def pinned(url, timeout=30):
+        calls.append(url)
+        return [
+            {
+                "name": "Example.Story.2019.1080p",
+                "info_hash": "ab" * 20,
+                "seeders": 3,
+                "size": 1,
+                "id": "1",
+            }
+        ]
 
-        def __exit__(self, *args):
-            return False
-
-        def read(self):
-            return b'[{"name":"Example.Story.2019.1080p","info_hash":"' + b"ab" * 20 + b'","seeders":3,"size":1,"id":"1"}]'
-
-    def urlopen(request, timeout=30):
-        calls.append(request.full_url)
-        return Response()
-
-    monkeypatch.setattr(search_mod.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(
+        search_mod, "validate_search_endpoint", lambda endpoint, resolve=True: endpoint
+    )
+    monkeypatch.setattr(search_mod, "_https_get_json_pinned", pinned)
     first = search_mod.fetch_hits("Example Story", "https://example.test/q.php")
     second = search_mod.fetch_hits("Example Story", "https://example.test/q.php")
     assert len(calls) == 1
@@ -590,21 +591,14 @@ def test_empty_search_results_are_not_cached(monkeypatch):
     search_mod._HITS_CACHE.clear()
     calls = []
 
-    class Response:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return False
-
-        def read(self):
-            return b"[]"
-
-    def urlopen(request, timeout=30):
+    def pinned(url, timeout=30):
         calls.append(1)
-        return Response()
+        return []
 
-    monkeypatch.setattr(search_mod.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(
+        search_mod, "validate_search_endpoint", lambda endpoint, resolve=True: endpoint
+    )
+    monkeypatch.setattr(search_mod, "_https_get_json_pinned", pinned)
     assert search_mod.fetch_hits("Zzz Missing", "https://example.test/q.php") == []
     assert search_mod.fetch_hits("Zzz Missing", "https://example.test/q.php") == []
     assert len(calls) == 2

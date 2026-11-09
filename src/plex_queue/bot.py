@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import hmac
 import logging
 import re
@@ -102,7 +103,8 @@ LABEL_REPLY = re.compile(
 
 def build_application(config: Config, service: Service, access: Access, importer=None) -> Application:
     limiter = Limiter()
-    claim_limiter = Limiter()
+    claim_user_limiter = Limiter()
+    claim_global_limiter = Limiter()
     pending: dict[int, str] = {}
     app = Application.builder().token(config.token).build()
 
@@ -142,15 +144,27 @@ def build_application(config: Config, service: Service, access: Access, importer
         uid = user_id(update)
         if uid is None:
             return
-        # Global bucket so many Telegram accounts cannot amplify guesses against setup_secret.
-        if not claim_limiter.allow(0, 5):
+        given = " ".join(context.args).strip()
+        if not given:
+            await reply(update, "Usage: /claim <setup_secret>")
+            return
+        if not config.setup_secret_ready:
+            await reply(
+                update,
+                "Set a private setup_secret (16+ characters) in config.yaml, then restart the bot.",
+            )
+            return
+        # Per-account and global buckets slow down guessing of setup_secret.
+        if not claim_user_limiter.allow(uid, 3):
             await reply(update, "Too many claim attempts this hour. Try again later.")
             return
-        given = " ".join(context.args)
-        if config.setup_secret in {"", "change-this-secret"}:
-            await reply(update, "Set a private setup_secret in config.yaml, then restart the bot.")
+        if not claim_global_limiter.allow(0, 8):
+            await reply(update, "Too many claim attempts this hour. Try again later.")
             return
-        if not hmac.compare_digest(config.setup_secret, given):
+        # Digest both sides so length differences do not short-circuit compare_digest.
+        expected = hashlib.sha256(config.setup_secret.encode("utf-8")).digest()
+        provided = hashlib.sha256(given.encode("utf-8")).digest()
+        if not hmac.compare_digest(expected, provided):
             await reply(update, "That claim secret is wrong.")
             return
         await reply(update, access.claim(uid))
@@ -369,15 +383,22 @@ def build_application(config: Config, service: Service, access: Access, importer
             pending[uid] = query.strip()
             await reply(update, _clarify_text(query), CHOOSE)
             return
-        limit = 30 if access.is_owner(uid) else 10
+        is_owner = access.is_owner(uid)
+        limit = 30 if is_owner else config.guest_hourly_limit
         # Collection / "all seasons" sweeps fan out many nested lookups; charge more.
+        # Guests: one collection sweep per hour at the default limit of 5.
         preview = parse_request(query)
-        cost = 10 if preview.collection else 1
+        if preview.collection:
+            cost = 10 if is_owner else limit
+        else:
+            cost = 1
         if not limiter.allow(uid, limit, cost=cost):
             await reply(update, "Too many requests this hour. Try again later.")
             return
         await reply(update, "Checking the library...")
-        result = await _work(lambda: service.request(query, kind=kind))
+        result = await _work(
+            lambda: service.request(query, kind=kind, as_guest=not is_owner)
+        )
         if isinstance(result, Clarify):
             pending[uid] = result.query
             await reply(update, result.text, CHOOSE)

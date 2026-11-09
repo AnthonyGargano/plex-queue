@@ -373,7 +373,7 @@ def _config(tmp_path: Path, owner_id: int = 0) -> Config:
     return Config(
         path=tmp_path / "config.yaml",
         token="token",
-        setup_secret="secret",
+        setup_secret="secret-secret-16",
         owner_id=owner_id,
         allowed_user_ids=(),
         deluge_username="localclient",
@@ -385,6 +385,7 @@ def _config(tmp_path: Path, owner_id: int = 0) -> Config:
         ssh_local_port=15884,
         ssh_remote_port=58846,
         ssh_known_hosts=tmp_path / "known_hosts",
+        ssh_allow_tofu=False,
         min_height=1080,
         plex_db=None,
         roots=(),
@@ -398,4 +399,6 @@ def _config(tmp_path: Path, owner_id: int = 0) -> Config:
         import_every=600,
         tidy_auto=False,
         tidy_buckets={},
+        guest_hourly_limit=5,
+        guest_max_active=3,
     )

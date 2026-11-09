@@ -44,15 +44,17 @@ def ensure_known_host(
     *,
     key: Path | None = None,
     user: str = "",
+    allow_tofu: bool = False,
     keyscan: str | None = None,
     ssh: str | None = None,
     run=subprocess.run,
 ) -> bool:
     """Pin the VM host key once. Later connects refuse a changed key.
 
-    Prefers ssh-keyscan lines that name this host. On Windows, keyscan often
-    cannot negotiate, so a one-time `ssh` login with accept-new fills the file
-    (TOFU). Fingerprints are logged so the operator can verify the first pin.
+    Prefers ssh-keyscan lines that name this host. The accept-new SSH fallback
+    (TOFU) runs only when ``allow_tofu`` is true — otherwise the operator must
+    pin via keyscan or a trusted manual known_hosts entry. Fingerprints are
+    logged so the first pin can be verified out of band.
     """
     if not host.strip():
         return False
@@ -62,6 +64,15 @@ def ensure_known_host(
     if _keyscan_pin(host, known_hosts, keyscan=keyscan, run=run):
         _log_fingerprints(host, known_hosts, source="ssh-keyscan", run=run)
         return True
+    if not allow_tofu:
+        log.error(
+            "SSH host key for %s is not pinned and deluge.ssh.allow_tofu is false. "
+            "Run ssh-keyscan on a trusted network into %s, or set allow_tofu: true "
+            "for a one-time accept-new pin you will verify.",
+            host,
+            known_hosts,
+        )
+        return False
     if key is None or not user:
         return False
     if not _ssh_pin(host, known_hosts, key=key, user=user, ssh=ssh, run=run):

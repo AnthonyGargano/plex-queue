@@ -672,10 +672,17 @@ def _apply_trash(row, roots, trash_dir, plex, library, recycle=None) -> str:
     keep = str(row.get("keep") or "")
     if not keep:
         raise OSError("Duplicate trash requires a keep path.")
-    if not Path(keep).is_file():
-        raise OSError("Keep path is missing; refusing to trash the duplicate.")
-    if not under_roots(Path(keep), roots):
-        raise OSError("Keep path is outside the library roots.")
+    keep_path = Path(keep)
+    # Re-validate ledger paths at apply time (do not trust a tampered tidy.json).
+    _assert_safe_library_file(keep_path, roots)
+    _assert_safe_library_file(source, roots)
+    if path_key(source) == path_key(keep_path):
+        raise OSError("Duplicate trash source and keep path must differ.")
+    # Prefer trashing the smaller/weaker file if a ledger row was swapped.
+    if _file_size(source) > _file_size(keep_path):
+        raise OSError(
+            "Refusing to trash a larger file than the keep path; re-run /tidy."
+        )
     dest = move_to_trash(
         source,
         trash_dir,
@@ -701,6 +708,12 @@ def _apply_trash(row, roots, trash_dir, plex, library, recycle=None) -> str:
 
 def _apply_scan(row, plex, roots) -> str:
     directory = Path(str(row.get("source") or row.get("dest") or ""))
+    try:
+        info = directory.lstat()
+    except OSError as exc:
+        raise OSError("Scan path is missing.") from exc
+    if stat.S_ISLNK(info.st_mode):
+        raise OSError("Refusing to scan a symlink path from the tidy ledger.")
     try:
         resolved = directory.resolve()
     except OSError as exc:

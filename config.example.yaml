@@ -1,9 +1,15 @@
 telegram:
   token: "PUT_BOT_TOKEN_HERE"
+  # At least 16 characters. Example: python -c "import secrets; print(secrets.token_hex(16))"
   setup_secret: "change-this-secret"
-  # Your numeric Telegram id. 0 until you send /claim <setup_secret> to the bot.
+  # Prefer setting your numeric Telegram id here after first claim (authoritative).
+  # 0 means ownership comes from a MAC-signed data/access.json after /claim.
   owner_id: 0
+  # Prefer empty here and /allow after claim. YAML entries cannot be removed with /deny.
   allowed_user_ids: []
+  # Guests (non-owner) request budget per hour and max unfinished Deluge torrents.
+  guest_hourly_limit: 5
+  guest_max_active: 3
 
 vm:
   name: UbuntuClean
@@ -14,11 +20,13 @@ deluge:
   # Leave blank to use Deluge's folder on the VM (/home/ttt/Downloads).
   download_location: ""
   ssh:
-    host: 172.30.161.89
+    host: "PUT_VM_SSH_HOST_HERE"
     user: ttt
     key_path: '%USERPROFILE%\.ssh\plex-queue_ed25519'
     # Dedicated known_hosts file. The bot pins the VM key here and refuses changes.
     known_hosts: 'data/ssh_known_hosts'
+    # false (default): require ssh-keyscan / manual pin. true: one-time accept-new TOFU.
+    allow_tofu: false
     local_port: 15884
     remote_port: 58846
 
@@ -27,29 +35,18 @@ library:
   min_height: 1080
   plex_db: '%LOCALAPPDATA%\Plex Media Server\Plug-in Support\Databases\com.plexapp.plugins.library.db'
   roots:
-    - 'D:\Movies4'
-    - 'D:\Shows4'
-    - 'E:\3tb xternal\Shows'
-    - 'G:\Kids Shows2'
-    - 'G:\Shows2'
+    - 'D:\Movies'
+    - 'D:\Shows'
+    - 'E:\Shows'
+    - 'G:\Kids Shows'
     - 'H:\Documentary'
-    - 'H:\Kids Movies2'
-    - 'H:\Movies3'
-    - 'H:\Pure Pwnage'
-    - 'H:\Pure_pwnage_Season1and2'
+    - 'H:\Kids Movies'
     - 'I:\Movies'
-    - 'J:\Kids Movies'
-    - 'J:\Movies2'
-    - 'J:\ToP'
     - 'L:\Anime\Movies'
     - 'L:\Anime\Shows'
-    - 'L:\Christmas Movies'
-    - 'L:\Documentary'
-    - 'L:\Kid Shows'
-    - 'L:\Standup'
-    - 'L:\Workouts'
 
 search:
+  # Must be https and not a private/loopback IP (config-tamper SSRF guard).
   endpoint: "https://apibay.org/q.php"
 
 import:
@@ -57,16 +54,13 @@ import:
   # Leave at least this much free on the drive after the copy.
   margin_gb: 2
   # Optional on Windows (/drop uses the Recycle Bin). Required elsewhere.
-  trash_dir: 'D:\Movies4\_trash'
+  trash_dir: 'D:\Movies\_trash'
   movies:
-    - 'D:\Movies4'
-    - 'H:\Movies3'
+    - 'D:\Movies'
     - 'I:\Movies'
-    - 'J:\Movies2'
   shows:
-    - 'D:\Shows4'
-    - 'E:\3tb xternal\Shows'
-    - 'G:\Shows2'
+    - 'D:\Shows'
+    - 'E:\Shows'
 
 # Library tidy (/tidy). Propose fixes; owner confirms before any move/trash.
 # auto stays false until proposals look trustworthy.
@@ -74,13 +68,10 @@ tidy:
   auto: false
   # Optional. When omitted, buckets are derived from library.roots + import folders.
   # buckets:
-  #   movies: ['D:\Movies4', 'H:\Movies3', 'I:\Movies', 'J:\Movies2']
-  #   shows: ['D:\Shows4', 'E:\3tb xternal\Shows', 'G:\Shows2']
-  #   kids_movies: ['H:\Kids Movies2', 'J:\Kids Movies']
-  #   kids_shows: ['G:\Kids Shows2', 'L:\Kid Shows']
+  #   movies: ['D:\Movies', 'I:\Movies']
+  #   shows: ['D:\Shows', 'E:\Shows']
+  #   kids_movies: ['H:\Kids Movies']
+  #   kids_shows: ['G:\Kids Shows']
   #   anime_movies: ['L:\Anime\Movies']
   #   anime_shows: ['L:\Anime\Shows']
-  #   christmas: ['L:\Christmas Movies']
-  #   documentary: ['H:\Documentary', 'L:\Documentary']
-  #   standup: ['L:\Standup']
-  #   workouts: ['L:\Workouts']
+  #   documentary: ['H:\Documentary']

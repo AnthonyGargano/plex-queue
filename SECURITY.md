@@ -4,6 +4,8 @@ This document defines how security vulnerabilities are reported, triaged, remedi
 
 It is intended for use across repositories and internal software programs. Replace bracketed placeholders before publishing. Keep this file at the repository root as `SECURITY.md` so GitHub surfaces it under the Security tab.
 
+**Engineering baseline for this repository:** implement and review code against §§9–11 (secrets, secure development, supply chain) at this corporate bar. `SECURITY_homelab.md` is an operator-facing disclosure variant only; it does not relax code controls.
+
 ---
 
 ## 1. Principles
@@ -262,6 +264,7 @@ Security-relevant changes may require additional review from `[security champion
 - Report project-specific exploitability even if the root cause is upstream.
 - For pure upstream CVEs with no project aggravation, prefer upstream reporting and open a normal (non-security) dependency-update PR if a fixed version exists.
 - We monitor GitHub Dependabot / advisory alerts where enabled and prioritize by exploitability and reachability, not CVE score alone.
+- For this repository: keep runtime deps minimal in `pyproject.toml`; enable Dependabot (or run `pip audit` periodically) before merging dependency bumps.
 
 ---
 

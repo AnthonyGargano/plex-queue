@@ -10,7 +10,7 @@ from plex_queue.errors import public_error
 from plex_queue.imdb import Identity, fetch_collection, fetch_imdb
 from plex_queue.library import fill_heights
 from plex_queue.models import Torrent, bucket, torrent_line
-from plex_queue.place import Label, cleaned_title, under_roots
+from plex_queue.place import Label, cleaned_title, is_complete, under_roots
 from plex_queue.search import magnet_uri
 from plex_queue.titles import (
     MAX_SHOW_SEASONS,
@@ -61,6 +61,7 @@ class Service:
         tidy_buckets: dict | None = None,
         import_margin: int = 0,
         plex_db: Path | None = None,
+        guest_max_active: int = 0,
     ):
         self.library = library
         self.search = search
@@ -75,11 +76,32 @@ class Service:
         self.tidy_buckets = dict(tidy_buckets or {})
         self.import_margin = int(import_margin or 0)
         self.plex_db = Path(plex_db) if plex_db else getattr(library, "plex_db", None)
+        self.guest_max_active = max(0, int(guest_max_active or 0))
         self._lock = threading.RLock()
+
+    def guest_queue_blocked(self, extra: int = 1) -> str | None:
+        """Return a user message when guests should not start more downloads.
+
+        ``extra`` is how many magnets are about to be added (default one).
+        """
+        max_active = self.guest_max_active
+        if max_active <= 0:
+            return None
+        torrents = self.deluge.list_torrents()
+        active = sum(
+            1 for torrent in torrents
+            if not is_complete(torrent.state, torrent.progress)
+        )
+        if active + max(1, int(extra)) > max_active:
+            return (
+                f"There are already {active} active downloads "
+                f"(guest limit {max_active}). Try again later or ask the owner."
+            )
+        return None
 
     def request(
         self, query: str, kind: str | None = None, resolver=None,
-        collection_resolver=None, brief: bool = False,
+        collection_resolver=None, brief: bool = False, as_guest: bool = False,
     ) -> str | Clarify:
         display = cleaned_title(query)
         parsed = parse_request(query)
@@ -102,9 +124,11 @@ class Service:
             )
         if parsed.collection and not brief:
             if parsed.kind == "show":
-                return self._fill_show_seasons(parsed)
+                return self._fill_show_seasons(parsed, as_guest=as_guest)
             if parsed.kind == "movie":
-                return self._fill_gaps(parsed, collection_resolver, resolver)
+                return self._fill_gaps(
+                    parsed, collection_resolver, resolver, as_guest=as_guest,
+                )
             return _clarify(query)
         if parsed.kind not in {"movie", "show"}:
             return _clarify(query)
@@ -153,7 +177,7 @@ class Service:
                 hits = good_packs
             elif episode_hits:
                 return self._queue_season_episodes(
-                    parsed, display, copies, episode_hits, brief,
+                    parsed, display, copies, episode_hits, brief, as_guest=as_guest,
                 )
         decision = decide(copies, hits, self.min_height, season_coverage=season_coverage)
         if isinstance(decision, AlreadyHave):
@@ -169,7 +193,7 @@ class Service:
         if isinstance(decision, NoUpgrade):
             if season_coverage and episode_hits:
                 return self._queue_season_episodes(
-                    parsed, display, copies, episode_hits, brief,
+                    parsed, display, copies, episode_hits, brief, as_guest=as_guest,
                 )
             shown = _season_copy_label(decision.copy, season_label)
             if brief:
@@ -183,7 +207,7 @@ class Service:
         if isinstance(decision, NothingFound):
             if season_coverage and episode_hits:
                 return self._queue_season_episodes(
-                    parsed, display, copies, episode_hits, brief,
+                    parsed, display, copies, episode_hits, brief, as_guest=as_guest,
                 )
             if brief:
                 return "Nothing found to queue"
@@ -211,6 +235,10 @@ class Service:
                     f"Already in Deluge ({existing.state}, {existing.progress:.0f}%): {shown}"
                 )
                 return text if brief else self._noted(text)
+            if as_guest:
+                blocked = self.guest_queue_blocked()
+                if blocked:
+                    return "Guest download limit reached" if brief else blocked
             self.deluge.add_magnet(magnet_uri(decision.hit))
             self._remember(decision.hit.info_hash, parsed, display, decision.replacing)
 
@@ -253,6 +281,7 @@ class Service:
         copies: list,
         episode_hits: list,
         brief: bool,
+        as_guest: bool = False,
     ) -> str:
         """Queue the best release for each missing episode in a season."""
         owned = {
@@ -295,6 +324,7 @@ class Service:
         pending: list[tuple[int, object]] = []
         with self._lock:
             torrents = self.deluge.list_torrents()
+            planned: list[tuple[int, object, object | None]] = []
             for ep in sorted(best_by_ep):
                 hit = best_by_ep[ep]
                 replacing = copy_by_episode.get(ep)
@@ -311,6 +341,17 @@ class Service:
                     self._remember(existing.hash, parsed, display, replacing, episode=ep)
                     pending.append((ep, existing))
                     continue
+                planned.append((ep, hit, replacing))
+            # Guests: all-or-nothing — do not partially fill a season past the cap.
+            if as_guest and planned:
+                blocked = self.guest_queue_blocked(extra=len(planned))
+                if blocked:
+                    return blocked if not brief else "Guest download limit reached"
+            for ep, hit, replacing in planned:
+                if as_guest:
+                    blocked = self.guest_queue_blocked()
+                    if blocked:
+                        return blocked if not brief else "Guest download limit reached"
                 self.deluge.add_magnet(magnet_uri(hit))
                 self._remember(hit.info_hash, parsed, display, replacing, episode=ep)
                 torrents.append(
@@ -342,7 +383,9 @@ class Service:
             )
         return self._noted("\n".join(lines))
 
-    def _fill_gaps(self, parsed: Request, collection_resolver, resolver) -> str:
+    def _fill_gaps(
+        self, parsed: Request, collection_resolver, resolver, as_guest: bool = False,
+    ) -> str:
         """Check each movie in the set; queue ones that are missing or below quality."""
         name = parsed.franchise or " ".join(parsed.tokens)
         if len("".join(parsed.tokens)) < 3:
@@ -365,7 +408,9 @@ class Service:
         for member in members:
             label = member.title if not member.year else f"{member.title} ({member.year})"
             query = member.title if not member.year else f"{member.title} {member.year}"
-            result = self.request(query, kind="movie", resolver=resolver, brief=True)
+            result = self.request(
+                query, kind="movie", resolver=resolver, brief=True, as_guest=as_guest,
+            )
             if "Already on Plex" in result:
                 owned += 1
             elif "Already in Deluge" in result:
@@ -379,7 +424,7 @@ class Service:
         intro = f'Found {len(members)} movie(s) for "{name}":'
         return intro + "\n" + "\n".join(lines) + "\n\n" + head
 
-    def _fill_show_seasons(self, parsed: Request) -> str:
+    def _fill_show_seasons(self, parsed: Request, as_guest: bool = False) -> str:
         """Check each season of a show; queue missing or below-quality season packs."""
         name = parsed.franchise or " ".join(parsed.tokens)
         shown = " ".join(name.split())
@@ -402,7 +447,9 @@ class Service:
         last_hit = max(owned_seasons) if owned_seasons else 0
         stopped_after = None
         for season in range(1, MAX_SHOW_SEASONS + 1):
-            result = self.request(f"{shown} S{season:02d}", kind="show", brief=True)
+            result = self.request(
+                f"{shown} S{season:02d}", kind="show", brief=True, as_guest=as_guest,
+            )
             label = f"S{season:02d}"
             if _season_absent(result):
                 misses += 1
