@@ -40,7 +40,6 @@ A link tells me the exact movie or show. A bare title asks you to pick movie or 
 /recent week  or /recent month
 /status  counts
 /add <title>  same as sending the title
-/scan  reread Plex and the drives
 
 A copy at 1080p or higher gets a reply to check Plex. Widescreen files count as 1080p when the picture is 1920 wide, even if the frame is shorter.
 "All of the Clerks movies" or a trilogy lists every movie found, keeps ones already at 1080p, and queues missing or lower-quality ones.
@@ -62,6 +61,7 @@ CHOOSE = InlineKeyboardMarkup(
 OWNER_HELP = """\
 /rm <id>  remove from Deluge and keep the files
 /rmdata <id>  remove from Deluge and delete the files
+/scan  reread Plex and the drives
 /upgrades  lower-quality copies ready to retire after a confirmed upgrade
 /drop <id>  move that old copy to the Recycle Bin (Windows)
 /keep <id>  leave the old copy and clear it from the list
@@ -234,10 +234,15 @@ def build_application(config: Config, service: Service, access: Access, importer
         window = "day"
         if context.args:
             window = context.args[0]
-        await reply(update, await _work(lambda: service.recent(window)))
+        uid = user_id(update) or 0
+        reveal = access.is_owner(uid)
+        await reply(
+            update,
+            await _work(lambda: service.recent(window, reveal_paths=reveal)),
+        )
 
     async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not await allowed(update):
+        if not await allowed(update, owner_only=True):
             return
         await reply(update, "Reading Plex and the drives...")
         await reply(update, await _work(service.scan))

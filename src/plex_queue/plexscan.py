@@ -6,6 +6,8 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+from plex_queue.errors import public_error
+
 
 def read_plex_token() -> str:
     if os.name != "nt":
@@ -99,7 +101,9 @@ class PlexScan:
             try:
                 refresh_section(self.base, sid, directory, token, self.urlopen)
             except Exception as exc:
-                notes.append(f"Files are in {directory}. Plex scan failed: {exc}")
+                notes.append(
+                    f"Files are in {directory}. Plex scan failed: {public_error(exc)}"
+                )
                 continue
             notes.append(f"Asked Plex to scan {directory}.")
             refreshed.append(directory)

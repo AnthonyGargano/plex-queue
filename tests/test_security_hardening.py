@@ -81,6 +81,38 @@ def test_guest_max_active_blocks_season_episode_fanout(tmp_path):
     assert deluge.added == []
 
 
+def test_guest_season_fanout_is_all_or_nothing(tmp_path):
+    library = Library(None, [])
+    active = [Torrent("1" * 40, "Busy1", "Downloading", 10.0, 0, 0)]
+    deluge = _Deluge(active)
+    hits = [
+        Hit("Example.Show.S01E01.1080p", "c" * 40, 30, 1),
+        Hit("Example.Show.S01E02.1080p", "d" * 40, 30, 1),
+        Hit("Example.Show.S01E03.1080p", "e" * 40, 30, 1),
+    ]
+    service = Service(library, _Search(hits), deluge, guest_max_active=3)
+    text = service.request("Example Show S01", kind="show", as_guest=True)
+    assert "guest limit" in text.lower() or "guest download limit" in text.lower()
+    assert deluge.added == []
+
+
+def test_recent_hides_paths_from_guests(tmp_path):
+    from plex_queue.ledger import Ledger
+    from plex_queue.place import Label
+
+    ledger = Ledger(tmp_path / "imports.json")
+    digest = "ab" * 20
+    dest = str(tmp_path / "Movies" / "Secret")
+    ledger.remember(digest, Label("movie", "Secret Film", 2020, None, None))
+    ledger.mark(digest, status="imported", dest=dest, imported_at="2099-01-01T00:00:00+00:00")
+    service = Service(Library(None, []), _Search([]), _Deluge(), ledger=ledger)
+    guest = service.recent("month", reveal_paths=False)
+    owner = service.recent("month", reveal_paths=True)
+    assert "Secret Film" in guest
+    assert dest not in guest
+    assert dest in owner
+
+
 def test_apply_trash_refuses_larger_source_than_keep(tmp_path):
     root = tmp_path / "Movies"
     root.mkdir()

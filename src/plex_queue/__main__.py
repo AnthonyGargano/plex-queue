@@ -203,11 +203,19 @@ def check(config) -> None:
         path = config.data_dir / relative
         if is_world_readable(path):
             problems.append(f"{path} is world-readable; tighten permissions.")
+    if config.ssh_allow_tofu:
+        problems.append(
+            "deluge.ssh.allow_tofu is true (MITM risk on first pin); prefer ssh-keyscan, then set false."
+        )
+    if config.tidy_auto:
+        problems.append(
+            "tidy.auto is true but auto-apply is not wired; leave it false until automation ships."
+        )
     if problems:
         print("Deluge was not contacted:")
         for problem in problems:
             print(f"- {problem}")
-        return
+        raise SystemExit(1)
     deluge = Deluge(config)
     try:
         torrents = deluge.list_torrents()
@@ -220,6 +228,15 @@ def check(config) -> None:
 
 
 def _boot(config) -> None:
+    if config.ssh_allow_tofu:
+        logging.warning(
+            "deluge.ssh.allow_tofu is enabled — first host-key pin can be MITMed; "
+            "verify fingerprints, then set allow_tofu: false"
+        )
+    if config.tidy_auto:
+        logging.warning(
+            "tidy.auto is set but unused; owner-confirmed /tidy apply remains required"
+        )
     logging.info("Checking %s", config.vm_name)
     try:
         status = ensure_running(config.vm_name, config.ssh_host)

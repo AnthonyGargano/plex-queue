@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-import json
+import urllib.error
 import urllib.parse
-import urllib.request
 from dataclasses import dataclass
 
 from plex_queue.cache import TtlCache
+from plex_queue.search import https_get_json_pinned
 
-SUGGEST = "https://v3.sg.media-imdb.com/suggestion/x/"
+SUGGEST_HOST = "v3.sg.media-imdb.com"
+SUGGEST = f"https://{SUGGEST_HOST}/suggestion/x/"
 SHOW_IDS = {"tvseries", "tvminiseries", "tvepisode"}
 MOVIE_IDS = {"movie", "tvmovie", "short", "video", "tvspecial"}
 
@@ -118,12 +119,7 @@ def known_collection(name: str, lookup, timeout: int = 20) -> list[Identity]:
 
 def suggest_rows(name: str, timeout: int = 20) -> list[dict]:
     safe = urllib.parse.quote(name.strip().lower())
-    req = urllib.request.Request(
-        SUGGEST + safe + ".json",
-        headers={"User-Agent": "plex-queue"},
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as response:
-        data = json.load(response)
+    data = _imdb_get_json(SUGGEST + safe + ".json", timeout=timeout)
     return list(data.get("d") or [])
 
 
@@ -155,12 +151,7 @@ def fetch_imdb(imdb_id: str, timeout: int = 20) -> Identity | None:
     if cached is not None:
         return cached
     safe = urllib.parse.quote(wanted)
-    req = urllib.request.Request(
-        SUGGEST + safe + ".json",
-        headers={"User-Agent": "plex-queue"},
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as response:
-        data = json.load(response)
+    data = _imdb_get_json(SUGGEST + safe + ".json", timeout=timeout)
     for row in data.get("d") or []:
         if str(row.get("id") or "").lower() != wanted:
             continue
@@ -172,6 +163,17 @@ def fetch_imdb(imdb_id: str, timeout: int = 20) -> Identity | None:
         _IMDB_CACHE.set(wanted, identity)
         return identity
     return None
+
+
+def _imdb_get_json(url: str, timeout: int = 20) -> dict:
+    """Fetch IMDB suggestion JSON with DNS pinning to a public IP only."""
+    host = urllib.parse.urlparse(url).hostname or ""
+    if host.lower() != SUGGEST_HOST:
+        raise urllib.error.URLError(f"imdb host not allowed: {host}")
+    data = https_get_json_pinned(url, timeout=timeout, label="imdb")
+    if not isinstance(data, dict):
+        return {}
+    return data
 
 
 def _kind(row: dict) -> str | None:

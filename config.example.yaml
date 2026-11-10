@@ -63,7 +63,8 @@ import:
     - 'E:\Shows'
 
 # Library tidy (/tidy). Propose fixes; owner confirms before any move/trash.
-# auto stays false until proposals look trustworthy.
+# auto is reserved for a future unattended apply path and is not wired yet —
+# leave false; setting true only logs a warning.
 tidy:
   auto: false
   # Optional. When omitted, buckets are derived from library.roots + import folders.

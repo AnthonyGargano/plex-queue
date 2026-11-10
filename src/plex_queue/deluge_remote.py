@@ -158,26 +158,24 @@ class Deluge:
             f"{self.config.ssh_user}@{self.config.ssh_host}",
         ]
         log.info("opening SSH tunnel to %s", self.config.ssh_host)
+        # DEVNULL for stderr: a PIPE without a reader can fill and hang ssh -N.
+        # Failed starts still show up via poll() + missing local port.
         self._process = subprocess.Popen(
             command,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
         )
         deadline = time.time() + 15
         while time.time() < deadline:
             if self._process.poll() is not None:
-                error = ""
-                if self._process.stderr:
-                    error = self._process.stderr.read().decode("utf-8", "replace").strip()
-                # Keep raw SSH stderr out of Telegram; log it for the operator.
-                if error:
-                    log.warning("ssh tunnel stderr: %s", error[:300])
                 raise DelugeError(
                     "SSH to the VM failed. Install the plex-queue key for ttt, then try again."
                 )
             if _port_open(self.config.ssh_local_port):
                 return
             time.sleep(0.2)
+        if self._process.poll() is None:
+            self._process.terminate()
         raise DelugeError("SSH tunnel to Deluge did not open.")
 
 

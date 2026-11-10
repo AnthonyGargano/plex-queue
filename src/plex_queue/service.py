@@ -81,19 +81,28 @@ class Service:
         self.guest_max_active = max(0, int(guest_max_active or 0))
         self._lock = threading.RLock()
 
-    def guest_queue_blocked(self, extra: int = 1) -> str | None:
+    def guest_active_count(self, torrents: list | None = None) -> int:
+        """Count incomplete Deluge torrents (optional pre-fetched list)."""
+        items = torrents if torrents is not None else self.deluge.list_torrents()
+        return sum(
+            1 for torrent in items
+            if not is_complete(torrent.state, torrent.progress)
+        )
+
+    def guest_queue_blocked(
+        self, extra: int = 1, *, active: int | None = None, torrents: list | None = None,
+    ) -> str | None:
         """Return a user message when guests should not start more downloads.
 
         ``extra`` is how many magnets are about to be added (default one).
+        Pass ``active`` to use a local running count (avoids stale re-lists and
+        mid-loop false blocks after a batch was pre-checked).
         """
         max_active = self.guest_max_active
         if max_active <= 0:
             return None
-        torrents = self.deluge.list_torrents()
-        active = sum(
-            1 for torrent in torrents
-            if not is_complete(torrent.state, torrent.progress)
-        )
+        if active is None:
+            active = self.guest_active_count(torrents)
         if active + max(1, int(extra)) > max_active:
             return (
                 f"There are already {active} active downloads "
@@ -151,7 +160,12 @@ class Service:
         )
         decision = decide(copies, [], self.min_height, season_coverage=season_coverage)
         if isinstance(decision, AlreadyHave):
-            return _already(decision, brief, season=parsed.season if season_coverage else None)
+            return _already(
+                decision,
+                brief,
+                season=parsed.season if season_coverage else None,
+                reveal_paths=not as_guest,
+            )
 
         hits = self._search_hits(parsed, display)
 
@@ -183,15 +197,20 @@ class Service:
                 )
         decision = decide(copies, hits, self.min_height, season_coverage=season_coverage)
         if isinstance(decision, AlreadyHave):
-            return _already(decision, brief, season=season_label)
+            return _already(
+                decision, brief, season=season_label, reveal_paths=not as_guest,
+            )
         if isinstance(decision, UnknownQuality):
             shown = _season_copy_label(decision.copy, season_label)
             if brief:
                 return f"Found a copy of unknown quality — {shown}"
-            return (
-                "I found a copy, but I can't tell whether it is 1080p, so I did not queue another one.\n"
-                f"{shown}\n{decision.copy.path}"
-            )
+            lines = [
+                "I found a copy, but I can't tell whether it is 1080p, so I did not queue another one.",
+                shown,
+            ]
+            if not as_guest:
+                lines.append(decision.copy.path)
+            return "\n".join(lines)
         if isinstance(decision, NoUpgrade):
             if season_coverage and episode_hits:
                 return self._queue_season_episodes(
@@ -222,7 +241,12 @@ class Service:
             latest = fill_heights(list(self.library.find(parsed)))
             final = decide(latest, [], self.min_height, season_coverage=season_coverage)
             if isinstance(final, AlreadyHave):
-                return _already(final, brief, season=parsed.season if season_coverage else None)
+                return _already(
+                    final,
+                    brief,
+                    season=parsed.season if season_coverage else None,
+                    reveal_paths=not as_guest,
+                )
             existing = _already_in_deluge(
                 self.deluge.list_torrents(),
                 decision.hit,
@@ -344,21 +368,22 @@ class Service:
                     pending.append((ep, existing))
                     continue
                 planned.append((ep, hit, replacing))
-            # Guests: all-or-nothing — do not partially fill a season past the cap.
+            # Guests: all-or-nothing against a local active count so mid-loop
+            # re-lists cannot under-count or claim the limit after a partial add.
+            local_active = self.guest_active_count(torrents)
             if as_guest and planned:
-                blocked = self.guest_queue_blocked(extra=len(planned))
+                blocked = self.guest_queue_blocked(
+                    extra=len(planned), active=local_active,
+                )
                 if blocked:
                     return blocked if not brief else "Guest download limit reached"
             for ep, hit, replacing in planned:
-                if as_guest:
-                    blocked = self.guest_queue_blocked()
-                    if blocked:
-                        return blocked if not brief else "Guest download limit reached"
                 self.deluge.add_magnet(magnet_uri(hit))
                 self._remember(hit.info_hash, parsed, display, replacing, episode=ep)
                 torrents.append(
                     Torrent(hit.info_hash, hit.name, "Queued", 0, 0, 0)
                 )
+                local_active += 1
                 queued.append((ep, hit))
 
         shown = display.strip() or " ".join(parsed.tokens)
@@ -448,6 +473,7 @@ class Service:
         misses = 0
         last_hit = max(owned_seasons) if owned_seasons else 0
         stopped_after = None
+        guest_capped = False
         for season in range(1, MAX_SHOW_SEASONS + 1):
             result = self.request(
                 f"{shown} S{season:02d}", kind="show", brief=True, as_guest=as_guest,
@@ -473,6 +499,10 @@ class Service:
             else:
                 blocked += 1
             lines.append(f"{label}: {result}")
+            # Stop probing further seasons once the guest active cap is hit.
+            if as_guest and "guest download limit" in result.lower():
+                guest_capped = True
+                break
         if not lines:
             return (
                 f'I couldn\'t find seasons of "{shown}". '
@@ -487,6 +517,8 @@ class Service:
                 f"\nNo releases found after S{stopped_after:02d} "
                 "(checked the next seasons in the index)."
             )
+        if guest_capped:
+            text += "\nStopped at the guest download limit."
         return text
 
     def listing(self, which: str) -> str:
@@ -512,8 +544,11 @@ class Service:
             f"Finished: {totals['done']}"
         )
 
-    def recent(self, window: str = "day") -> str:
-        """List imports transferred into library folders within the time window."""
+    def recent(self, window: str = "day", *, reveal_paths: bool = False) -> str:
+        """List imports transferred into library folders within the time window.
+
+        Guests see titles only; absolute library paths stay owner-only.
+        """
         key = (window or "day").strip().lower()
         chosen = RECENT_WINDOWS.get(key)
         if chosen is None:
@@ -543,7 +578,10 @@ class Service:
         lines = [f"Transferred in the past {label} ({len(rows)}):"]
         for when, short, title, dest in rows[:40]:
             stamp = when.astimezone().strftime("%b %d %I:%M %p")
-            lines.append(f"{stamp}  {short}  {title}\n  → {dest}")
+            if reveal_paths:
+                lines.append(f"{stamp}  {short}  {title}\n  → {dest}")
+            else:
+                lines.append(f"{stamp}  {short}  {title}")
         extra = len(rows) - min(len(rows), 40)
         if extra > 0:
             lines.append(f"…and {extra} more")
@@ -1148,27 +1186,39 @@ def _season_copy_label(copy, season: int | None) -> str:
     return f"{show} S{season:02d}"
 
 
-def _already(decision: AlreadyHave, brief: bool = False, season: int | None = None) -> str:
+def _already(
+    decision: AlreadyHave,
+    brief: bool = False,
+    season: int | None = None,
+    *,
+    reveal_paths: bool = True,
+) -> str:
     shown = _season_copy_label(decision.copy, season)
     if brief:
         return f"Already on Plex at {decision.height}p — {shown}"
     if season is not None:
-        return (
+        lines = [
             f"Already on Plex: season {season} episodes look complete at {decision.height}p "
-            f"through the highest episode I found.\n"
-            f"{shown}\n"
-            f"{decision.copy.path}\n"
+            "through the highest episode I found.",
+            shown,
+        ]
+        if reveal_paths:
+            lines.append(decision.copy.path)
+        lines.append(
             "Check Plex. If the season continues past that, request the next episode."
         )
+        return "\n".join(lines)
     extra = ""
     if decision.count > 1:
         extra = f"\n{decision.count} copies on disk. Best is {decision.height}p."
-    return (
-        f"Already on Plex at {decision.height}p.{extra}\n"
-        f"{decision.copy.label}\n"
-        f"{decision.copy.path}\n"
-        "Check Plex."
-    )
+    lines = [
+        f"Already on Plex at {decision.height}p.{extra}",
+        decision.copy.label,
+    ]
+    if reveal_paths:
+        lines.append(decision.copy.path)
+    lines.append("Check Plex.")
+    return "\n".join(lines)
 
 
 def _already_in_deluge(

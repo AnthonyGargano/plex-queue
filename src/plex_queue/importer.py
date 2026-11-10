@@ -106,12 +106,15 @@ class Importer:
         return "\n\n".join(part for part in [text, *notes] if part)
 
     def _cycle(self) -> list[str]:
+        from plex_queue.events import emit
+
         try:
             return self._cycle_body()
         except Exception as exc:
             # Keep partial progress (ledger flush still runs); surface a useful note
             # so /import does not only say "Something went wrong."
             log.exception("import cycle failed")
+            emit("import.cycle", status="fail", error=public_error(exc))
             return [f"Import cycle stopped early: {public_error(exc)}"]
         finally:
             self.ledger.flush()
@@ -119,6 +122,9 @@ class Importer:
     def _cycle_body(self) -> list[str]:
         if not self.reachable():
             log.info("import skipped; %s is not reachable", self.vm_name)
+            from plex_queue.events import emit
+
+            emit("import.cycle", status="skip", reason="vm_unreachable")
             return []
         finished, hashes = self.deluge.snapshot()
         notes = []
@@ -293,8 +299,9 @@ class Importer:
     def _place(self, job, root: Path) -> None:
         if not confined(job.local, root):
             raise TransferError(f"Refusing to write outside {root}.")
-        if job.local.exists():
-            if job.local.stat().st_size == job.size:
+        existing = _regular_size(job.local)
+        if existing is not None:
+            if existing == job.size:
                 return
             if job.local.suffix.lower() not in SUBTITLE_EXTENSIONS:
                 raise TransferError(
@@ -307,27 +314,30 @@ class Importer:
             retired = None
             try:
                 self.transport.fetch(job.remote, incoming, job.size)
-                if not incoming.exists() or incoming.stat().st_size != job.size:
-                    raise TransferError(f"{job.local.name} arrived incomplete.")
+                _require_regular_file(incoming, job.size, job.local.name)
                 retired = _retire_conflicting(job.local)
                 incoming.replace(job.local)
             except Exception:
                 incoming.unlink(missing_ok=True)
                 if (
                     retired is not None
-                    and not job.local.exists()
-                    and retired.exists()
+                    and _regular_size(job.local) is None
+                    and _regular_size(retired) is not None
                 ):
                     retired.rename(job.local)
                 raise
+            _require_regular_file(job.local, job.size, job.local.name)
             if not confined(job.local, root):
                 job.local.unlink(missing_ok=True)
                 raise TransferError(f"Refusing to leave a file outside {root}.")
             return
+        _refuse_planted_path(job.local)
         self.transport.fetch(job.remote, job.local, job.size)
-        if not job.local.exists() or job.local.stat().st_size != job.size:
+        try:
+            _require_regular_file(job.local, job.size, job.local.name)
+        except TransferError:
             job.local.unlink(missing_ok=True)
-            raise TransferError(f"{job.local.name} arrived incomplete.")
+            raise
         if not confined(job.local, root):
             job.local.unlink(missing_ok=True)
             raise TransferError(f"Refusing to leave a file outside {root}.")
@@ -599,6 +609,31 @@ def _refuse_planted_path(path: Path) -> None:
     path.unlink()
 
 
+def _regular_size(path: Path) -> int | None:
+    """Return size for a regular file; refuse symlinks; None if missing."""
+    try:
+        info = path.lstat()
+    except OSError:
+        return None
+    if stat.S_ISLNK(info.st_mode):
+        raise TransferError(f"Refusing to write through a symlink at {path.name}.")
+    if not stat.S_ISREG(info.st_mode):
+        raise TransferError(f"Refusing to overwrite a non-file at {path.name}.")
+    return int(info.st_size)
+
+
+def _require_regular_file(path: Path, size: int, label: str) -> None:
+    """Post-write check with lstat so a swapped symlink cannot pass."""
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise TransferError(f"{label} arrived incomplete.") from exc
+    if stat.S_ISLNK(info.st_mode):
+        raise TransferError(f"Refusing to leave a symlink at {label}.")
+    if not stat.S_ISREG(info.st_mode) or int(info.st_size) != size:
+        raise TransferError(f"{label} arrived incomplete.")
+
+
 def _retire_conflicting(path: Path) -> Path:
     """Rename an existing file to stem_N.suffix so a newer copy can take its place."""
     stem = path.stem
@@ -621,13 +656,18 @@ def send_telegram(token: str, chat_id: int, text: str, urlopen=None) -> None:
         return
     opener = urlopen or urllib.request.urlopen
     payload = urllib.parse.urlencode({"chat_id": str(chat_id), "text": text[:4000]}).encode()
+    # Bot token must live in the path for Telegram's HTTP API; never log this URL.
     request = urllib.request.Request(
         f"https://api.telegram.org/bot{token}/sendMessage",
         data=payload,
         method="POST",
     )
-    with opener(request, timeout=30) as response:
-        response.read()
+    try:
+        with opener(request, timeout=30) as response:
+            response.read()
+    except Exception as exc:
+        # Avoid leaking the bot token via urllib's URL-bearing exceptions.
+        raise RuntimeError(f"Telegram notify failed: {type(exc).__name__}") from None
 
 
 def _free_bytes(path: Path) -> int:

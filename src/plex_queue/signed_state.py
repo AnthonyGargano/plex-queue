@@ -38,19 +38,16 @@ def read_signed_json(path: Path, secret: str, *, label: str) -> dict:
         return {}
     body = {key: value for key, value in raw.items() if key != "mac"}
     if not setup_secret_ok(secret):
-        # Setup mode: accept unsigned historical state.
+        # Setup/dev only: bot and tidy CLI refuse to start without a ready secret,
+        # so production never serves this branch. Tests may use an empty secret.
         return body
     mac = str(raw.get("mac") or "")
     if not mac:
-        # Legacy unsigned file: re-sign immediately so there is no long trust window.
-        log.warning("%s has no MAC yet; resigning in place", label)
-        try:
-            write_signed_json(path, body, secret)
-        except OSError as exc:
-            log.warning("could not resign %s (%s); refusing unsigned body", label, exc)
-            _quarantine(path, f"{label} unsigned and could not resign")
-            return {}
-        return body
+        # Do not auto-trust unsigned bodies — an attacker who can write data/
+        # could plant replace_path / tidy sources and wait for a silent resign.
+        # Restore from a known-good backup, or delete the .bad file and rebuild.
+        _quarantine(path, f"{label} unsigned (missing MAC)")
+        return {}
     expected = state_mac(secret, body)
     if not hmac.compare_digest(mac, expected):
         _quarantine(path, f"{label} MAC invalid")

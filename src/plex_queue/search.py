@@ -78,6 +78,7 @@ def fetch_hits(
     # Re-check + resolve once; connect to that IP (DNS rebinding resistant).
     safe_endpoint = validate_search_endpoint(endpoint, resolve=True)
     url = safe_endpoint + "?" + urllib.parse.urlencode({"q": query})
+    # Call the underscored name so tests can monkeypatch it without DNS.
     rows = _https_get_json_pinned(url, timeout=timeout)
     hits = []
     for row in rows:
@@ -100,19 +101,19 @@ def fetch_hits(
     return list(matched)
 
 
-def _https_get_json_pinned(url: str, timeout: int = 30):
+def https_get_json_pinned(url: str, timeout: int = 30, *, label: str = "https"):
     """GET HTTPS JSON by connecting to a once-resolved public IP (SNI = hostname)."""
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme.lower() != "https":
-        raise urllib.error.URLError("search fetch requires https")
+        raise urllib.error.URLError(f"{label} fetch requires https")
     host = parsed.hostname
     if not host:
-        raise urllib.error.URLError("search fetch missing host")
+        raise urllib.error.URLError(f"{label} fetch missing host")
     port = parsed.port or 443
     path = parsed.path or "/"
     if parsed.query:
         path = f"{path}?{parsed.query}"
-    ip = _pinned_public_ip(host, port)
+    ip = _pinned_public_ip(host, port, label=label)
     context = ssl.create_default_context()
     conn = _PinnedHTTPSConnection(host, ip, port, timeout=timeout, context=context)
     try:
@@ -125,7 +126,7 @@ def _https_get_json_pinned(url: str, timeout: int = 30):
         try:
             if 300 <= int(response.status) < 400:
                 raise urllib.error.URLError(
-                    f"search.endpoint redirected ({response.status}); redirects are blocked"
+                    f"{label} redirected ({response.status}); redirects are blocked"
                 )
             if int(response.status) >= 400:
                 raise urllib.error.HTTPError(
@@ -138,6 +139,10 @@ def _https_get_json_pinned(url: str, timeout: int = 30):
         raise urllib.error.URLError(str(exc)) from exc
     finally:
         conn.close()
+
+
+# Private alias so unit tests can monkeypatch without hitting real DNS.
+_https_get_json_pinned = https_get_json_pinned
 
 
 class _PinnedHTTPSConnection(http.client.HTTPSConnection):
@@ -153,30 +158,32 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
         self.sock = self._context.wrap_socket(raw, server_hostname=server_hostname)
 
 
-def _pinned_public_ip(host: str, port: int) -> str:
+def _pinned_public_ip(host: str, port: int, *, label: str = "https") -> str:
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:
         ip = None
     if ip is not None:
-        _reject_special(ip, host)
+        _reject_special(ip, host, label=label)
         return str(ip)
     try:
         answers = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     except OSError as exc:
-        raise urllib.error.URLError(f"search.endpoint host could not be resolved: {host}") from exc
+        raise urllib.error.URLError(f"{label} host could not be resolved: {host}") from exc
     for entry in answers:
         address = entry[4][0]
         try:
             candidate = ipaddress.ip_address(address)
         except ValueError:
             continue
-        _reject_special(candidate, f"{host} -> {address}")
+        _reject_special(candidate, f"{host} -> {address}", label=label)
         return address
-    raise urllib.error.URLError(f"search.endpoint host could not be resolved: {host}")
+    raise urllib.error.URLError(f"{label} host could not be resolved: {host}")
 
 
-def _reject_special(ip: ipaddress.IPv4Address | ipaddress.IPv6Address, label: str) -> None:
+def _reject_special(
+    ip: ipaddress.IPv4Address | ipaddress.IPv6Address, detail: str, *, label: str = "https",
+) -> None:
     if (
         ip.is_private
         or ip.is_loopback
@@ -185,4 +192,6 @@ def _reject_special(ip: ipaddress.IPv4Address | ipaddress.IPv6Address, label: st
         or ip.is_multicast
         or ip.is_unspecified
     ):
-        raise urllib.error.URLError(f"search.endpoint must not target a private or special IP: {label}")
+        raise urllib.error.URLError(
+            f"{label} must not target a private or special IP: {detail}"
+        )

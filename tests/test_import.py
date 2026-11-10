@@ -720,13 +720,16 @@ def test_recent_lists_transfers_in_the_window(tmp_path):
     library = Library(None, [])
     library.loaded = True
     service = Service(library, object(), _Deluge([], set()), ledger=ledger)
-    day = service.recent("day")
+    day = service.recent("day", reveal_paths=True)
     assert "Example Story (2019)" in day
     assert str(dest) in day
     assert "Ancient Film" not in day
-    week = service.recent("week")
+    week = service.recent("week", reveal_paths=True)
     assert "Example Story (2019)" in week
     assert "Ancient Film" not in week
-    month = service.recent("month")
+    month = service.recent("month", reveal_paths=True)
     assert "Ancient Film (1990)" in month
     assert "Usage:" in service.recent("year")
+    guest = service.recent("day", reveal_paths=False)
+    assert "Example Story (2019)" in guest
+    assert str(dest) not in guest
