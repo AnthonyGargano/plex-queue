@@ -205,6 +205,9 @@ class Importer:
                     "on Plex confirmation — /upgrades."
                 )
         log.info("import cycle finished (%s note(s))", len(notes))
+        from plex_queue.events import emit
+
+        emit("import.cycle", status="ok", notes=len(notes))
         return notes
 
     def _one(self, download) -> tuple[str | None, list[Path]]:

@@ -11,7 +11,8 @@ Send a title in Telegram. A bare title asks whether it is a movie or a TV show b
 - If you don't have it, it is queued. A 1080p release is preferred when one is available.
 - `/active`, `/queue`, and `/done` show Deluge. The owner can `/rm` a torrent.
 - Every 10 minutes, while the VM is already on, finished downloads are copied to the movie or show drive with enough free space (2 GB left over). The copy on the VM is then removed, and Plex scans the new folder. Kids, anime, documentary, and the other special libraries are left alone. Change the `import:` folders in `config.yaml` to pick different drives. File paths that climb out of the download folder, or that would write outside the chosen library root, are refused.
-- The owner can `/tidy` to audit existing library files across all roots: duplicates (keep highest quality), orphans (ask Plex to scan), misplaced specials, and messy folder names. Fixes are propose-and-confirm (`/tidy apply <id>`, `/tidy apply dupes`, `/tidy orphans`, `/tidy skip <id>`). The same verbs work from the CLI: `python -m plex_queue tidy`.
+- The owner can `/tidy` to audit existing library files across all roots: duplicates (keep highest quality), orphans (ask Plex to scan), misplaced specials, and messy folder names. Fixes are propose-and-confirm (`/tidy apply <id>`, `/tidy apply dupes`, `/tidy apply renames 50`, `/tidy orphans`, `/tidy skip renames all`). The same verbs work from the CLI: `python -m plex_queue tidy`.
+- Structured JSON events are logged on the `plex_queue.events` logger (`tidy.audit`, `tidy.apply`, `import.cycle`, `upgrade.drop`, …) so a future Kafka → Grafana / autotick pipeline can subscribe without rewriting call sites.
 
 Other people can request titles after you `/allow` their Telegram id. Only the owner can remove torrents or change who is allowed.
 

@@ -21,12 +21,14 @@ from plex_queue.titles import (
     tokenize,
     video_height,
 )
+from plex_queue.events import duration_ms, emit, timed
 from plex_queue.tidy import (
     apply_action,
     audit,
     format_report,
     upgrade_replace_paths,
 )
+from plex_queue.tidy_select import parse_batch, select_rows
 from plex_queue.upgrades import RECYCLE_BIN, move_to_trash, path_key
 import shutil
 
@@ -653,6 +655,13 @@ class Service:
             )
             self._clear_replace_siblings(digest, replace_path, "gone")
             self.ledger.flush()
+            emit(
+                "upgrade.drop",
+                status="ok",
+                torrent_id=digest[:8],
+                user_id=user_id,
+                recycle=dest == RECYCLE_BIN,
+            )
         if dest == RECYCLE_BIN:
             return (
                 "Moved old copy to the Windows Recycle Bin.\n"
@@ -723,11 +732,25 @@ class Service:
         with self._lock:
             notes: list[str] = []
             if refresh:
+                started = timed()
                 self.library.refresh()
                 notes.extend(self.library.notes)
                 actions, space = self._audit_actions()
                 self.tidy_ledger.replace_pending([action.as_row() for action in actions])
                 notes.extend(space)
+                counts: dict[str, int] = {}
+                for action in actions:
+                    if action.status != "pending":
+                        continue
+                    counts[action.kind] = counts.get(action.kind, 0) + 1
+                emit(
+                    "tidy.audit",
+                    status="ok",
+                    user_id=user_id,
+                    pending=sum(counts.values()),
+                    counts=counts,
+                    duration_ms=duration_ms(started),
+                )
             rows = self.tidy_ledger.list(statuses={"pending", "blocked"})
             return format_report(
                 rows,
@@ -740,19 +763,23 @@ class Service:
             return "Only the owner can do that."
         if self.tidy_ledger is None:
             return "Tidy review is not set up."
-        text = (needle or "").strip().lower()
+        text = (needle or "").strip()
         if not text:
             return (
                 "Usage: /tidy apply <id>\n"
                 "/tidy apply dupes\n"
-                "/tidy orphans"
+                "/tidy orphans\n"
+                "/tidy apply renames 50\n"
+                "/tidy apply moves 1-20\n"
+                "Selectors: 50 | 1-100 | 1:50 | 1,5,987 | s01 | s01:05 | all"
             )
         with self._lock:
-            if text in {"dupes", "duplicates", "trash"}:
-                return self._tidy_apply_many({"trash"}, user_id)
-            if text in {"orphans", "orphan", "scans", "scan"}:
-                return self._tidy_apply_many({"scan"}, user_id)
-            action_id, row, error = self.tidy_ledger.find(text, {"pending", "blocked"})
+            kind, selector = parse_batch(text)
+            if kind is not None:
+                return self._tidy_apply_many({kind}, user_id, selector=selector)
+            action_id, row, error = self.tidy_ledger.find(
+                text.lower(), {"pending", "blocked"},
+            )
             if error or action_id is None or row is None:
                 return error or "Nothing matched that tidy id."
             if row.get("status") == "blocked" or row.get("kind") == "report":
@@ -760,6 +787,7 @@ class Service:
                     f"id {action_id} is report-only.\n"
                     f"{row.get('detail') or 'No automatic fix.'}"
                 )
+            started = timed()
             try:
                 message = apply_action(
                     row,
@@ -772,9 +800,27 @@ class Service:
                 )
             except OSError as exc:
                 self.tidy_ledger.mark(action_id, status="failed", error=public_error(exc))
+                emit(
+                    "tidy.apply",
+                    status="failed",
+                    action_id=action_id,
+                    kind=row.get("kind"),
+                    user_id=user_id,
+                    error=public_error(exc),
+                    duration_ms=duration_ms(started),
+                )
                 return f"Could not apply tidy {action_id}: {public_error(exc)}"
             self.tidy_ledger.mark(action_id, status="done")
             self.tidy_ledger.cancel_related(row.get("source"), except_id=action_id)
+            emit(
+                "tidy.apply",
+                status="ok",
+                action_id=action_id,
+                kind=row.get("kind"),
+                user_id=user_id,
+                confidence=row.get("confidence") or "plex",
+                duration_ms=duration_ms(started),
+            )
             return f"Applied {action_id}.\n{message}"
 
     def tidy_skip(self, needle: str, user_id: int = 0) -> str:
@@ -782,25 +828,65 @@ class Service:
             return "Only the owner can do that."
         if self.tidy_ledger is None:
             return "Tidy review is not set up."
+        text = (needle or "").strip()
+        if not text:
+            return (
+                "Usage: /tidy skip <id>\n"
+                "/tidy skip renames all\n"
+                "/tidy skip moves 1-50"
+            )
         with self._lock:
+            kind, selector = parse_batch(text)
+            if kind is not None:
+                return self._tidy_skip_many({kind}, user_id, selector=selector)
             action_id, row, error = self.tidy_ledger.find(
-                needle, {"pending", "blocked", "failed"},
+                text.lower(), {"pending", "blocked", "failed"},
             )
             if error or action_id is None or row is None:
                 return error or "Nothing matched that tidy id."
             self.tidy_ledger.mark(action_id, status="skipped")
             title = row.get("title") or action_id
+            emit(
+                "tidy.skip",
+                status="ok",
+                action_id=action_id,
+                kind=row.get("kind"),
+                user_id=user_id,
+            )
             return f"Skipped {action_id} ({title})."
 
-    def _tidy_apply_many(self, kinds: set[str], user_id: int) -> str:
+    def _tidy_apply_many(
+        self, kinds: set[str], user_id: int, *, selector: str = "",
+    ) -> str:
         rows = self.tidy_ledger.pending(kinds)
-        if not rows:
+        # Bulk dupes only apply Plex-linked matches; weak title hits are id-only.
+        if kinds == {"trash"}:
+            rows = [
+                row for row in rows
+                if str(row.get("confidence") or "plex") == "plex"
+            ]
+        # Large move/rename batches require an explicit selector (count/range/all).
+        if kinds & {"move", "rename"} and not (selector or "").strip():
+            return (
+                f"Pending {next(iter(kinds))} actions: {len(rows)}.\n"
+                "Pass a selector so this is intentional, e.g.\n"
+                f"/tidy apply {next(iter(kinds))}s 50\n"
+                f"/tidy apply {next(iter(kinds))}s 1-100\n"
+                f"/tidy apply {next(iter(kinds))}s all"
+            )
+        chosen, error = select_rows(rows, selector)
+        if error:
+            return error
+        if not chosen:
             return f"No pending {'/'.join(sorted(kinds))} actions."
-        results = []
-        for row in rows:
+        started = timed()
+        ok = 0
+        failed = 0
+        failures: list[str] = []
+        for row in chosen:
             action_id = str(row.get("id") or "")
             try:
-                message = apply_action(
+                apply_action(
                     row,
                     roots=self.roots,
                     trash_dir=self.trash_dir,
@@ -811,12 +897,58 @@ class Service:
                 )
             except OSError as exc:
                 self.tidy_ledger.mark(action_id, status="failed", error=public_error(exc))
-                results.append(f"{action_id}: failed — {public_error(exc)}")
+                failed += 1
+                if len(failures) < 15:
+                    failures.append(f"{action_id}: failed — {public_error(exc)}")
                 continue
             self.tidy_ledger.mark(action_id, status="done")
             self.tidy_ledger.cancel_related(row.get("source"), except_id=action_id)
-            results.append(f"{action_id}: {message}")
-        return f"Applied {len(results)} action(s):\n\n" + "\n\n".join(results)
+            ok += 1
+        emit(
+            "tidy.apply_batch",
+            status="ok" if failed == 0 else "partial",
+            kinds=sorted(kinds),
+            selector=selector or "all",
+            requested=len(chosen),
+            ok=ok,
+            failed=failed,
+            user_id=user_id,
+            duration_ms=duration_ms(started),
+        )
+        lines = [f"Applied {ok} action(s), {failed} failed (of {len(chosen)})."]
+        if failures:
+            lines.append("")
+            lines.extend(failures)
+            leftover = failed - len(failures)
+            if leftover > 0:
+                lines.append(f"…and {leftover} more failures")
+        return "\n".join(lines)
+
+    def _tidy_skip_many(
+        self, kinds: set[str], user_id: int, *, selector: str = "",
+    ) -> str:
+        rows = self.tidy_ledger.pending(kinds)
+        if kinds & {"move", "rename"} and not (selector or "").strip():
+            return (
+                f"Pending {next(iter(kinds))} actions: {len(rows)}.\n"
+                "Pass a selector, e.g. /tidy skip renames all"
+            )
+        chosen, error = select_rows(rows, selector)
+        if error:
+            return error
+        if not chosen:
+            return f"No pending {'/'.join(sorted(kinds))} actions to skip."
+        for row in chosen:
+            self.tidy_ledger.mark(str(row.get("id") or ""), status="skipped")
+        emit(
+            "tidy.skip_batch",
+            status="ok",
+            kinds=sorted(kinds),
+            selector=selector or "all",
+            count=len(chosen),
+            user_id=user_id,
+        )
+        return f"Skipped {len(chosen)} {'/'.join(sorted(kinds))} action(s)."
 
     def _audit_actions(self):
         upgrade_paths = set()

@@ -28,6 +28,8 @@ def main(argv: list[str] | None = None) -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # Structured JSON events (plex_queue.events) stay on the root handler as
+    # one JSON object per line — ready to ship to Kafka without a second sink.
     parser = argparse.ArgumentParser(prog="plex-queue")
     parser.add_argument(
         "command",
@@ -59,8 +61,8 @@ def main(argv: list[str] | None = None) -> None:
     search = _Search(config.search_endpoint)
     deluge = Deluge(config)
     access = Access(config)
-    ledger = Ledger(config.data_dir / "imports.json")
-    tidy_ledger = TidyLedger(config.data_dir / "tidy.json")
+    ledger = Ledger(config.data_dir / "imports.json", secret=config.setup_secret)
+    tidy_ledger = TidyLedger(config.data_dir / "tidy.json", secret=config.setup_secret)
     plex = PlexScan(config.plex_db, read_plex_token)
     service = Service(
         library,
@@ -126,8 +128,8 @@ def tidy_cli(config, argv: list[str] | None = None) -> None:
     owner = access.owner_id or config.owner_id
     if not owner:
         raise SystemExit("Set telegram.owner_id (or /claim) before using tidy apply.")
-    ledger = Ledger(config.data_dir / "imports.json")
-    tidy_ledger = TidyLedger(config.data_dir / "tidy.json")
+    ledger = Ledger(config.data_dir / "imports.json", secret=config.setup_secret)
+    tidy_ledger = TidyLedger(config.data_dir / "tidy.json", secret=config.setup_secret)
     plex = PlexScan(config.plex_db, read_plex_token)
 
     class _NoDeluge:

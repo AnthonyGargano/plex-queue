@@ -97,6 +97,7 @@ class Action:
     keep: str | None = None
     status: str = "pending"
     bucket: str | None = None
+    confidence: str = "plex"  # plex = same metadata item; weak = title heuristic
 
     def as_row(self) -> dict:
         return asdict(self)
@@ -358,21 +359,24 @@ def format_report(
         lines.append(f"Blocked/report-only: {blocked}")
     lines.append(
         "Owner commands: /tidy apply <id>   /tidy skip <id>\n"
-        "/tidy apply dupes   /tidy orphans"
+        "/tidy apply dupes   /tidy orphans\n"
+        "/tidy apply renames 50   /tidy apply moves 1-20\n"
+        "/tidy apply renames 1,5,9   /tidy skip renames all\n"
+        "Selectors: 50 | 1-100 | 1:50 | 1,5,987 | s01 | s01:05 | s01e03 | all"
     )
     shown = pending[:limit]
-    for row in shown:
-        lines.append(_action_line(row))
+    for index, row in enumerate(shown, start=1):
+        lines.append(_action_line(row, index=index))
     extra = len(pending) - len(shown)
     if extra > 0:
-        lines.append(f"…and {extra} more")
+        lines.append(f"…and {extra} more (indexes continue after this page on re-audit)")
     if notes:
         lines.append("")
         lines.extend(notes)
     return "\n".join(lines)
 
 
-def _action_line(row: dict) -> str:
+def _action_line(row: dict, index: int | None = None) -> str:
     kind = row.get("kind")
     aid = row.get("id")
     title = row.get("title") or ""
@@ -380,7 +384,10 @@ def _action_line(row: dict) -> str:
     source = row.get("source") or ""
     keep = row.get("keep") or ""
     dest = row.get("dest") or ""
-    bits = [f"id {aid}  [{kind}]  {title}", f"  {detail}"]
+    confidence = row.get("confidence") or ""
+    prefix = f"#{index} " if index is not None else ""
+    weak = " weak" if confidence == "weak" else ""
+    bits = [f"{prefix}id {aid}  [{kind}{weak}]  {title}", f"  {detail}"]
     if keep:
         bits.append(f"  keep: {keep}")
     if source:
@@ -441,6 +448,7 @@ def _duplicate_actions(
                         source=loser,
                         keep=winner,
                         status="pending",
+                        confidence="plex",
                     )
                 )
 
@@ -476,6 +484,8 @@ def _duplicate_actions(
             if not loser.height or not winner.height or loser.height >= winner.height:
                 continue
             covered.add(loser_key)
+            # Title-only matches can collide; keep pending but mark weak so
+            # /tidy apply dupes skips them unless the owner targets the id.
             actions.append(
                 Action(
                     id=action_id("trash", loser.path, winner.path),
@@ -483,12 +493,14 @@ def _duplicate_actions(
                     priority=PRIORITY["trash"],
                     title=winner.label,
                     detail=(
-                        f"Duplicate title group. Keep {winner.height}p "
-                        f"({Path(winner.path).name}), trash {loser.height}p."
+                        f"WEAK title match (not same Plex item). Keep {winner.height}p "
+                        f"({Path(winner.path).name}), trash {loser.height}p. "
+                        "Apply by id only after you confirm."
                     ),
                     source=loser.path,
                     keep=winner.path,
                     status="pending",
+                    confidence="weak",
                 )
             )
     return actions
@@ -624,6 +636,22 @@ def _layout_actions(
             continue
         # Only rewrite layout when the destination is free or is the same file.
         if expected.exists() and path_key(expected) != path_key(copy.path):
+            actions.append(
+                Action(
+                    id=action_id("rename-blocked", copy.path, expected),
+                    kind="report",
+                    priority=PRIORITY["report"],
+                    title=copy.label,
+                    detail=(
+                        f"Messy layout under {root.name}, but normalized path "
+                        f"already exists: {expected.name}"
+                    ),
+                    source=copy.path,
+                    dest=str(expected),
+                    bucket=current_bucket,
+                    status="blocked",
+                )
+            )
             continue
         actions.append(
             Action(

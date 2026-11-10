@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import json
 import logging
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
 from plex_queue.place import Label
+from plex_queue.signed_state import read_signed_json, write_signed_json
 
 log = logging.getLogger(__name__)
 
@@ -25,16 +25,10 @@ def _stamp_from_dest(dest: object) -> str | None:
     return datetime.fromtimestamp(mtime, tz=timezone.utc).replace(microsecond=0).isoformat()
 
 
-def _private(path: Path) -> None:
-    from plex_queue.securefs import protect_dir, protect_file
-
-    protect_dir(path.parent)
-    protect_file(path)
-
-
 class Ledger:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, secret: str = ""):
         self.path = path
+        self._secret = str(secret or "")
         self._lock = threading.Lock()
         self._data: dict | None = None
         self._dirty = False
@@ -119,27 +113,10 @@ class Ledger:
         return self._data
 
     def _read(self) -> dict:
-        if not self.path.exists():
-            return {}
-        try:
-            raw = json.loads(self.path.read_text(encoding="utf-8")) or {}
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            bad = self.path.with_suffix(".json.bad")
-            log.warning("import ledger unreadable (%s); moving to %s", exc, bad)
-            try:
-                self.path.replace(bad)
-            except OSError:
-                pass
-            return {}
-        return raw if isinstance(raw, dict) else {}
+        return read_signed_json(self.path, self._secret, label="import ledger")
 
     def _flush_unlocked(self) -> None:
         if self._data is None or not self._dirty:
             return
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(self._data, indent=2), encoding="utf-8")
-        _private(temporary)
-        temporary.replace(self.path)
-        _private(self.path)
+        write_signed_json(self.path, self._data, self._secret)
         self._dirty = False

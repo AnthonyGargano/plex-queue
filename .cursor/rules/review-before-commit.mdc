@@ -1,0 +1,26 @@
+---
+description: Require Bugbot and Security Review before any commit; fix and re-run until clean
+alwaysApply: true
+---
+
+# Review gate before commit
+
+Treat **Bugbot** and **Security Review** as a hard gate on every code change in this repo.
+
+## Required
+
+1. After implementing or changing code (any slice that produces a diff), run **Bugbot** and **Security Review** on the relevant changes (`uncommitted changes` while iterating; `branch changes` once on a branch).
+2. Fix every real finding. Re-run both reviews until:
+   - Bugbot reports no bugs
+   - Security Review reports no issues
+3. **Do not create a git commit**, amend, or push until both reviews are clean for that diff.
+4. Do not treat “tests passed” or “lints clean” as a substitute for these reviews.
+5. If the user asks to commit/push and reviews are not done or not clean, run the review loop first (or refuse the commit until it passes).
+
+## Security focus (always)
+
+When Security Review runs, include attention to: path confinement, trash/move/delete safety, owner-only Telegram/CLI apply, symlink refusal, secrets in config/logs, and anything that can relocate or destroy library files.
+
+## After commit / follow-up fixes
+
+If a later fix lands, re-run the same gate on the new diff before any further commit.

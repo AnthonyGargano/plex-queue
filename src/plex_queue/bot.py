@@ -67,7 +67,9 @@ OWNER_HELP = """\
 /keep <id>  leave the old copy and clear it from the list
 /tidy  audit library (duplicates, orphans, misplaced, layout)
 /tidy apply <id>  run one proposed fix
-/tidy apply dupes  trash all pending duplicate losers
+/tidy apply dupes  trash strong (Plex-linked) duplicates
+/tidy apply renames 50   /tidy apply moves 1-20
+/tidy apply renames all  /tidy skip renames all
 /tidy orphans  ask Plex to scan orphan folders
 /tidy skip <id>  dismiss a proposal
 /import  run one import cycle now (copy finished downloads, scan Plex)
@@ -114,8 +116,30 @@ def build_application(config: Config, service: Service, access: Access, importer
 
     async def reply(update: Update, text: str, markup=None) -> None:
         message = update.effective_message
-        if message:
-            await message.reply_text(text[:4000], reply_markup=markup)
+        if not message:
+            return
+        # Telegram hard limit is 4096; chunk so batch tidy results are not silently cut.
+        limit = 3500
+        body = text or ""
+        if len(body) <= limit:
+            await message.reply_text(body, reply_markup=markup)
+            return
+        chunks = []
+        start = 0
+        while start < len(body):
+            end = min(start + limit, len(body))
+            if end < len(body):
+                split = body.rfind("\n", start, end)
+                if split > start + 500:
+                    end = split + 1
+            chunks.append(body[start:end])
+            start = end
+        for index, chunk in enumerate(chunks):
+            suffix = f"\n…({index + 1}/{len(chunks)})" if len(chunks) > 1 else ""
+            await message.reply_text(
+                (chunk + suffix)[:4000],
+                reply_markup=markup if index == 0 else None,
+            )
 
     async def allowed(update: Update, owner_only: bool = False) -> bool:
         uid = user_id(update)
@@ -268,31 +292,38 @@ def build_application(config: Config, service: Service, access: Access, importer
         rest = " ".join(context.args[1:]).strip() if context.args and len(context.args) > 1 else ""
         if verb in {"apply", "do"}:
             needle = rest or (args[1] if len(args) > 1 else "")
-            # When user sends "/tidy apply dupes", rest is "dupes".
             if not needle and len(args) > 1:
                 needle = args[1]
-            await reply(update, await _work(lambda: service.tidy_apply(needle, uid)))
+            await reply(update, "Working on tidy apply...")
+            await reply(update, await _work(lambda: service.tidy_apply(needle, uid), tidy=True))
             return
         if verb in {"skip", "keep"}:
             if not rest:
-                await reply(update, "Usage: /tidy skip <id>")
+                await reply(
+                    update,
+                    "Usage: /tidy skip <id>\n/tidy skip renames all",
+                )
                 return
-            await reply(update, await _work(lambda: service.tidy_skip(rest, uid)))
+            await reply(update, await _work(lambda: service.tidy_skip(rest, uid), tidy=True))
             return
         if verb in {"orphans", "orphan"}:
-            await reply(update, await _work(lambda: service.tidy_apply("orphans", uid)))
+            await reply(update, "Working on orphan scans...")
+            await reply(update, await _work(lambda: service.tidy_apply("orphans", uid), tidy=True))
             return
         if verb in {"refresh", "audit"}:
             await reply(update, "Auditing the library...")
-            await reply(update, await _work(lambda: service.tidy(uid, refresh=True)))
+            await reply(update, await _work(lambda: service.tidy(uid, refresh=True), tidy=True))
             return
         await reply(
             update,
             "Usage: /tidy\n"
             "/tidy apply <id>\n"
             "/tidy apply dupes\n"
+            "/tidy apply renames 50\n"
+            "/tidy apply moves 1-20\n"
             "/tidy orphans\n"
-            "/tidy skip <id>",
+            "/tidy skip <id>\n"
+            "/tidy skip renames all",
         )
 
     async def add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -413,7 +444,7 @@ def build_application(config: Config, service: Service, access: Access, importer
         if not reachable:
             await reply(update, f"{config.vm_name} is off. Starting it...")
 
-    async def _work(func):
+    async def _work(func, *, tidy: bool = False):
         import asyncio
 
         try:
@@ -421,7 +452,13 @@ def build_application(config: Config, service: Service, access: Access, importer
         except DelugeError as exc:
             log.warning("deluge: %s", type(exc).__name__)
             return public_error(exc)
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        except OSError as exc:
+            if tidy:
+                log.warning("tidy failed: %s", exc)
+                return public_error(exc)
+            log.warning("search failed: %s", exc)
+            return "The search index didn't answer. Try again in a minute."
+        except (urllib.error.URLError, TimeoutError) as exc:
             log.warning("search failed: %s", exc)
             return "The search index didn't answer. Try again in a minute."
         except Exception:
