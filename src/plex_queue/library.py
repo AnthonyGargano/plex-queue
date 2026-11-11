@@ -76,6 +76,31 @@ class Library:
                 log.info("library noted %s new file(s) without a full walk", added)
             return added
 
+    def remember_move(self, source: Path, dest: Path) -> None:
+        """Update the in-memory index after a tidy move without re-reading Plex.
+
+        Batch ``tidy apply moves`` used to call note_files()+invalidate() per
+        file, which reopened the Plex DB thousands of times and eventually
+        crashed with ``database disk image is malformed``.
+        """
+        with self._lock:
+            if not self.loaded:
+                return
+            src_key = _key(str(source))
+            self.copies = [
+                copy for copy in self.copies if _key(copy.path) != src_key
+            ]
+            known = {_key(copy.path) for copy in self.copies}
+            for video in _videos_from(dest):
+                key = _key(str(video))
+                if key in known:
+                    continue
+                stem = video.stem.lower()
+                if "trailer" in stem or stem.endswith("sample"):
+                    continue
+                self.copies.append(copy_from_file(video))
+                known.add(key)
+
     def _refresh_unlocked(self, include_disk: bool = True) -> None:
         copies: list[Copy] = []
         notes: list[str] = []
@@ -188,54 +213,66 @@ def copy_from_file(path: Path) -> Copy:
 
 def load_plex(path: Path) -> list[Copy]:
     uri = path.resolve().as_posix()
-    connection = sqlite3.connect(f"file:{uri}?mode=ro&immutable=1", uri=True)
     try:
-        cursor = connection.cursor()
-        copies = []
-        for title, year, width, height, file_path in cursor.execute(
-            """
-            SELECT mi.title, mi.year, m.width, m.height, mp.file
-            FROM metadata_items mi
-            JOIN media_items m ON m.metadata_item_id = mi.id AND m.deleted_at IS NULL
-            JOIN media_parts mp ON mp.media_item_id = m.id AND mp.deleted_at IS NULL
-            WHERE mi.deleted_at IS NULL AND mi.metadata_type = 1 AND mp.file IS NOT NULL
-            """
-        ):
-            copies.append(
-                make_copy(
-                    "movie", title or "", year, None, None, None,
-                    screen_height(width, height), file_path,
-                )
-            )
-        for title, show, year, season, episode, width, height, file_path in cursor.execute(
-            """
-            SELECT episode.title, show.title, show.year, season."index",
-                   episode."index", m.width, m.height, mp.file
-            FROM metadata_items episode
-            JOIN metadata_items season ON season.id = episode.parent_id
-            JOIN metadata_items show ON show.id = season.parent_id
-            JOIN media_items m ON m.metadata_item_id = episode.id AND m.deleted_at IS NULL
-            JOIN media_parts mp ON mp.media_item_id = m.id AND mp.deleted_at IS NULL
-            WHERE episode.deleted_at IS NULL
-              AND episode.metadata_type = 4
-              AND mp.file IS NOT NULL
-            """
-        ):
-            copies.append(
-                make_copy(
-                    "episode",
-                    title or "",
-                    year,
-                    show,
-                    season,
-                    episode,
-                    screen_height(width, height),
-                    file_path,
-                )
-            )
-        return copies
+        connection = sqlite3.connect(f"file:{uri}?mode=ro&immutable=1", uri=True)
+    except sqlite3.Error as exc:
+        raise OSError(f"Plex database could not be opened: {exc}") from exc
+    try:
+        try:
+            return _load_plex_rows(connection.cursor())
+        except sqlite3.DatabaseError as exc:
+            raise OSError(
+                "Plex database is unreadable (malformed or locked). "
+                "Close Plex and retry, or repair/restore the DB."
+            ) from exc
     finally:
         connection.close()
+
+
+def _load_plex_rows(cursor) -> list[Copy]:
+    copies = []
+    for title, year, width, height, file_path in cursor.execute(
+        """
+        SELECT mi.title, mi.year, m.width, m.height, mp.file
+        FROM metadata_items mi
+        JOIN media_items m ON m.metadata_item_id = mi.id AND m.deleted_at IS NULL
+        JOIN media_parts mp ON mp.media_item_id = m.id AND mp.deleted_at IS NULL
+        WHERE mi.deleted_at IS NULL AND mi.metadata_type = 1 AND mp.file IS NOT NULL
+        """
+    ):
+        copies.append(
+            make_copy(
+                "movie", title or "", year, None, None, None,
+                screen_height(width, height), file_path,
+            )
+        )
+    for title, show, year, season, episode, width, height, file_path in cursor.execute(
+        """
+        SELECT episode.title, show.title, show.year, season."index",
+               episode."index", m.width, m.height, mp.file
+        FROM metadata_items episode
+        JOIN metadata_items season ON season.id = episode.parent_id
+        JOIN metadata_items show ON show.id = season.parent_id
+        JOIN media_items m ON m.metadata_item_id = episode.id AND m.deleted_at IS NULL
+        JOIN media_parts mp ON mp.media_item_id = m.id AND mp.deleted_at IS NULL
+        WHERE episode.deleted_at IS NULL
+          AND episode.metadata_type = 4
+          AND mp.file IS NOT NULL
+        """
+    ):
+        copies.append(
+            make_copy(
+                "episode",
+                title or "",
+                year,
+                show,
+                season,
+                episode,
+                screen_height(width, height),
+                file_path,
+            )
+        )
+    return copies
 
 
 def _videos_from(path: Path):

@@ -489,6 +489,201 @@ def test_plex_refresh_uses_the_matching_section_and_hides_the_token():
     assert seen["token"] == "secret-token"
     assert "secret-token" not in seen["url"]
     assert "/library/sections/1/refresh" in seen["url"]
+    assert "path=" in seen["url"]
+
+
+def test_refresh_section_full_omits_path():
+    seen = {}
+
+    class Response:
+        def read(self):
+            return b""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def urlopen(request, timeout):
+        seen["url"] = request.full_url
+        return Response()
+
+    refresh_section("http://127.0.0.1:32400", 2, None, "secret-token", urlopen)
+    assert seen["url"] == "http://127.0.0.1:32400/library/sections/2/refresh"
+
+
+def test_plexscan_refresh_all_unique_sections(tmp_path, monkeypatch):
+    import sqlite3
+
+    from plex_queue.plexscan import PlexScan
+
+    db = tmp_path / "library.db"
+    connection = sqlite3.connect(db)
+    connection.execute(
+        "CREATE TABLE section_locations (library_section_id INTEGER, root_path TEXT)"
+    )
+    connection.executemany(
+        "INSERT INTO section_locations VALUES (?, ?)",
+        [
+            (1, str(tmp_path / "Movies")),
+            (1, str(tmp_path / "Movies2")),
+            (3, str(tmp_path / "Shows")),
+        ],
+    )
+    connection.commit()
+    connection.close()
+    called: list[tuple[str, str]] = []
+
+    class Response:
+        def read(self):
+            return b""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def urlopen(request, timeout):
+        called.append((request.get_method(), request.full_url))
+        assert "path=" not in request.full_url
+        assert request.get_header("X-plex-token") == "tok"
+        return Response()
+
+    plex = PlexScan(db, token_reader=lambda: "tok", urlopen=urlopen)
+    notes, ids = plex.refresh_all()
+    assert ids == [1, 3]
+    assert called[0] == ("DELETE", "http://127.0.0.1:32400/library/sections/all/refresh")
+    assert [method for method, _url in called[1:]] == ["GET", "GET"]
+    assert [url.rstrip("/").split("/")[-2] for _method, url in called[1:]] == ["1", "3"]
+    assert any("Stopped any in-progress" in note for note in notes)
+    assert any("section 1" in note for note in notes)
+    assert any("section 3" in note for note in notes)
+
+
+def test_cancel_all_refreshes_uses_delete():
+    from plex_queue.plexscan import cancel_all_refreshes
+
+    seen = {}
+
+    class Response:
+        def read(self):
+            return b""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def urlopen(request, timeout):
+        seen["method"] = request.get_method()
+        seen["url"] = request.full_url
+        assert request.get_header("X-plex-token") == "tok"
+        return Response()
+
+    cancel_all_refreshes("http://127.0.0.1:32400", "tok", urlopen)
+    assert seen["method"] == "DELETE"
+    assert seen["url"] == "http://127.0.0.1:32400/library/sections/all/refresh"
+
+
+def test_parse_activities_json_and_xml():
+    import json
+
+    from plex_queue.plexscan import format_scan_activities, parse_activities
+
+    payload = {
+        "MediaContainer": {
+            "Activity": [
+                {
+                    "type": "library.update.section",
+                    "title": "Scanning Anime Shows",
+                    "subtitle": "Season 1",
+                    "progress": 40,
+                    "Context": {"librarySectionID": "7"},
+                }
+            ]
+        }
+    }
+    rows = parse_activities(json.dumps(payload).encode())
+    assert len(rows) == 1
+    assert rows[0].title == "Scanning Anime Shows"
+    assert rows[0].progress == 40
+    assert rows[0].section_id == 7
+    assert "Scanning Anime Shows" in format_scan_activities(rows)
+
+    xml = """<?xml version="1.0"?>
+    <MediaContainer size="1">
+      <Activity type="library.update.section" title="Scanning Movies" subtitle="Road House" progress="12">
+        <Context librarySectionID="1"/>
+      </Activity>
+    </MediaContainer>"""
+    rows = parse_activities(xml)
+    assert rows[0].title == "Scanning Movies"
+    assert rows[0].section_id == 1
+
+
+def test_refresh_plex_posts_progress_while_waiting():
+    from plex_queue.access import Access
+    from plex_queue.library import Library
+    from plex_queue.plexscan import PlexActivity
+    from plex_queue.service import Service
+
+    class FakeAccess:
+        def is_owner(self, user_id):
+            return user_id == 7
+
+    class FakePlex:
+        def __init__(self):
+            self.calls = 0
+
+        def refresh_all(self, restart=True):
+            return ["Asked Plex to refresh section 1."], [1]
+
+        def list_activities(self):
+            self.calls += 1
+            if self.calls == 1:
+                return [
+                    PlexActivity(
+                        "library.update.section",
+                        "Scanning Movies",
+                        "Example",
+                        25,
+                        1,
+                    )
+                ]
+            return []
+
+    class FakeLibrary:
+        notes = ["Plex index: 1 files"]
+
+        def refresh(self):
+            return None
+
+    messages = []
+    service = Service(
+        FakeLibrary(),
+        lambda q: [],
+        type("D", (), {"boot_note": ""})(),
+        1080,
+        FakeAccess(),
+        None,
+        plex=FakePlex(),
+    )
+    text = service.refresh_plex(
+        7,
+        progress=messages.append,
+        poll_seconds=5,
+        max_wait_seconds=60,
+        min_wait_seconds=0,
+        idle_polls=3,
+        sleep=lambda _seconds: None,
+    )
+    assert any("Starting a full Plex refresh" in msg or "Stopping any" in msg for msg in messages)
+    assert any("Scanning Movies" in msg for msg in messages)
+    assert any("looks finished" in msg or "another section" in msg for msg in messages)
+    assert "Plex refresh request complete" in text
 
 
 def test_ssh_copy_quotes_spaces_and_checks_the_size(tmp_path):

@@ -8,6 +8,7 @@ from plex_queue.library import Library
 from plex_queue.models import Hit, Torrent
 from plex_queue.service import Service
 from plex_queue.tidy import apply_action
+from plex_queue.upgrades import path_key
 
 
 class _Search:
@@ -113,29 +114,118 @@ def test_recent_hides_paths_from_guests(tmp_path):
     assert dest in owner
 
 
-def test_apply_trash_refuses_larger_source_than_keep(tmp_path):
+def test_apply_trash_allows_larger_lower_res_file(tmp_path):
     root = tmp_path / "Movies"
     root.mkdir()
-    keep = root / "Keep.mkv"
-    loser = root / "Loser.mkv"
+    keep = root / "Example.Story.1080p.mkv"
+    loser = root / "Example.Story.720p.mkv"
     keep.write_bytes(b"small")
     loser.write_bytes(b"much-larger-duplicate-file")
+    trash_dir = tmp_path / "trash"
+    trash_dir.mkdir()
     row = {
-        "id": "swap0001",
+        "id": "big72001",
         "kind": "trash",
         "priority": 1,
         "title": "Example",
-        "detail": "tampered swap",
+        "detail": "larger lower-res encode",
         "source": str(loser),
         "keep": str(keep),
         "status": "pending",
+        "keep_height": 1080,
+        "source_height": 720,
+    }
+    apply_action(row, roots=[root], trash_dir=trash_dir, recycle=False)
+    assert keep.exists()
+    assert not loser.exists()
+
+
+def test_apply_trash_refuses_divergent_episode_titles(tmp_path):
+    root = tmp_path / "Shows"
+    root.mkdir()
+    keep = root / "Doctor Who - old - time - s01e04 - cosmic time.avi"
+    loser = root / "Doctor Who - old - doctor who - s01e04 - the firemaker.avi"
+    keep.write_bytes(b"a" * 50)
+    loser.write_bytes(b"b" * 80)
+    row = {
+        "id": "dwbad001",
+        "kind": "trash",
+        "priority": 1,
+        "title": "Doctor Who",
+        "detail": "bad plex merge",
+        "source": str(loser),
+        "keep": str(keep),
+        "status": "pending",
+        "keep_height": 432,
+        "source_height": 384,
     }
     try:
         apply_action(row, roots=[root], trash_dir=tmp_path / "trash", recycle=False)
         assert False, "expected OSError"
     except OSError as exc:
-        assert "larger" in str(exc).lower()
+        assert "same title" in str(exc).lower()
     assert loser.exists()
+    assert keep.exists()
+
+
+def test_apply_trash_refuses_active_upgrade_path(tmp_path):
+    root = tmp_path / "Movies"
+    root.mkdir()
+    keep = root / "Example.Story.1080p.mkv"
+    loser = root / "Example.Story.720p.mkv"
+    keep.write_bytes(b"keep")
+    loser.write_bytes(b"lose")
+    row = {
+        "id": "upg00001",
+        "kind": "trash",
+        "priority": 1,
+        "title": "Example",
+        "detail": "claimed by upgrade",
+        "source": str(loser),
+        "keep": str(keep),
+        "status": "pending",
+        "keep_height": 1080,
+        "source_height": 720,
+    }
+    try:
+        apply_action(
+            row,
+            roots=[root],
+            trash_dir=tmp_path / "trash",
+            recycle=False,
+            upgrade_paths={path_key(loser)},
+        )
+        assert False, "expected OSError"
+    except OSError as exc:
+        assert "upgrade" in str(exc).lower()
+    assert loser.exists()
+
+
+def test_apply_trash_refuses_higher_source_height(tmp_path):
+    root = tmp_path / "Movies"
+    root.mkdir()
+    keep = root / "Example.Story.720p.mkv"
+    better = root / "Example.Story.1080p.mkv"
+    keep.write_bytes(b"a" * 100)
+    better.write_bytes(b"b" * 50)
+    row = {
+        "id": "swap0002",
+        "kind": "trash",
+        "priority": 1,
+        "title": "Example",
+        "detail": "tampered height swap",
+        "source": str(better),
+        "keep": str(keep),
+        "status": "pending",
+        "keep_height": 720,
+        "source_height": 1080,
+    }
+    try:
+        apply_action(row, roots=[root], trash_dir=tmp_path / "trash", recycle=False)
+        assert False, "expected OSError"
+    except OSError as exc:
+        assert "resolution" in str(exc).lower()
+    assert better.exists()
     assert keep.exists()
 
 

@@ -34,7 +34,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("run", "check", "tidy"),
+        choices=("run", "check", "tidy", "refresh"),
         default="run",
     )
     parser.add_argument("tidy_args", nargs="*", help="tidy subcommand args")
@@ -47,6 +47,9 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args.command == "tidy":
         tidy_cli(config, args.tidy_args)
+        return
+    if args.command == "refresh":
+        refresh_cli(config)
         return
     if not config.ready:
         raise SystemExit("Put the Telegram bot token in config.yaml first.")
@@ -113,21 +116,20 @@ def main(argv: list[str] | None = None) -> None:
         deluge.close()
 
 
-def tidy_cli(config, argv: list[str] | None = None) -> None:
-    """Owner-facing local tidy without Telegram: audit / apply / skip."""
+def _owner_service(config) -> tuple[Service, int]:
+    """Build a local owner Service (no Deluge) for CLI tidy/refresh."""
     from plex_queue.access import Access as _Access
 
     if not config.setup_secret_ready:
         raise SystemExit(
             "Choose a private telegram.setup_secret (16+ characters) in config.yaml first."
         )
-    argv = list(argv or [])
     library = Library(config.plex_db, list(config.roots))
     access = _Access(config)
     # CLI uses the configured owner id; require it so apply cannot run anonymously.
     owner = access.owner_id or config.owner_id
     if not owner:
-        raise SystemExit("Set telegram.owner_id (or /claim) before using tidy apply.")
+        raise SystemExit("Set telegram.owner_id (or /claim) before using owner CLI commands.")
     ledger = Ledger(config.data_dir / "imports.json", secret=config.setup_secret)
     tidy_ledger = TidyLedger(config.data_dir / "tidy.json", secret=config.setup_secret)
     plex = PlexScan(config.plex_db, read_plex_token)
@@ -154,6 +156,13 @@ def tidy_cli(config, argv: list[str] | None = None) -> None:
         plex_db=config.plex_db,
         guest_max_active=config.guest_max_active,
     )
+    return service, owner
+
+
+def tidy_cli(config, argv: list[str] | None = None) -> None:
+    """Owner-facing local tidy without Telegram: audit / apply / skip."""
+    argv = list(argv or [])
+    service, owner = _owner_service(config)
     if not argv:
         print(service.tidy(owner, refresh=True))
         return
@@ -175,6 +184,12 @@ def tidy_cli(config, argv: list[str] | None = None) -> None:
         "       python -m plex_queue tidy apply <id|dupes|orphans>\n"
         "       python -m plex_queue tidy skip <id>"
     )
+
+
+def refresh_cli(config) -> None:
+    """Ask Plex Media Server to fully refresh every library section."""
+    service, owner = _owner_service(config)
+    print(service.refresh_plex(owner, progress=print))
 
 
 def check(config) -> None:

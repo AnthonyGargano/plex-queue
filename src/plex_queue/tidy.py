@@ -22,12 +22,30 @@ from plex_queue.place import (
     under_roots,
 )
 from plex_queue.plexscan import load_sections, section_id
-from plex_queue.titles import tokenize
+from plex_queue.titles import (
+    RESOLUTION_NUMBERS,
+    Request,
+    TAGS,
+    YEAR,
+    parse_request,
+    tokenize,
+    video_height,
+)
 from plex_queue.upgrades import (
     RECYCLE_BIN,
     move_to_trash,
     path_key,
     plex_parts_by_item,
+)
+
+_EXTRA_DIR_NAMES = frozenset({
+    "extras", "extra", "bonus", "bonuses", "featurettes", "featurette",
+    "interviews", "interview", "trailers", "trailer", "samples", "sample",
+    "deleted scenes", "deleted_scenes", "behind the scenes", "behind_the_scenes",
+})
+_EXTRA_NAME_MARKERS = (
+    "post-show", "after-show", "aftershow", "talking.", "deleted scene",
+    "bonus scene", "behind the scenes", "featurette",
 )
 
 log = logging.getLogger(__name__)
@@ -54,6 +72,26 @@ BUCKET_ORDER = (
     "movies",
     "shows",
 )
+
+# Intentional specialized shelves — never pull files off them. Plex genres are
+# noisy (White Christmas → family/kids while it belongs on the Christmas shelf;
+# Dragon Ball Z / Malcolm already live on anime/kids). Only propose moves
+# *into* these buckets from generic movies/shows.
+_SPECIALIZED_BUCKETS = frozenset({
+    "kids_movies",
+    "kids_shows",
+    "anime_movies",
+    "anime_shows",
+    "christmas",
+    "documentary",
+    "standup",
+    "workouts",
+})
+
+# Show trees keep featurettes/extras/holiday episodes. Plex often tags those
+# clips as movies or holiday, which must not rip them into Movies/Christmas.
+_SHOW_FAMILY = frozenset({"shows", "kids_shows", "anime_shows"})
+_KIDS_EXPLICIT = frozenset({"kids", "children"})
 
 # Word-boundary checks so "Movies" is not treated as kids ("kid" ⊂ "movies").
 _KIDS = re.compile(r"\bkids?\b|\bchildren\b", re.IGNORECASE)
@@ -84,6 +122,69 @@ GENRE_BUCKETS = {
     "workout": "workouts",
 }
 
+_STANDUP_TAGS = frozenset({"stand-up", "standup", "stand up"})
+_CHRISTMAS_TAGS = frozenset({"holiday", "christmas"})
+_DOC_TAGS = frozenset({"documentary"})
+_WORKOUT_TAGS = frozenset({"fitness", "workout", "workouts"})
+# Strict person standup title: optional honorific + First Last: Special.
+# Allow initials/abbreviations (Louis C.K., Ms. Pat). Never match franchises
+# like "Star Wars: …" / "Men in Black: …" via the denylist below.
+_STANDUP_SPECIAL = re.compile(
+    # "Dr Jason Leong: …" / "Ms. Pat: …"
+    r"^(?:dr\.?|ms\.?|mr\.?|mrs\.?)\s+"
+    r"[a-z][a-z'’.]*(?:\s+[a-z][a-z'’.]*){1,2}:\s+\S"
+    # Exactly "First Last: …" (Louis C.K. ok). Not "American Pie Presents: …".
+    r"|^(?!the\b|a\b|an\b)[a-z][a-z'’.]*\s+[a-z][a-z'’.]*:\s+\S",
+    re.IGNORECASE,
+)
+_NOT_STANDUP_TITLE = re.compile(
+    r"(?i)^(?:"
+    r"south park|star wars|star trek|american pie|austin powers|men in black|"
+    r"guardians of|pirates of|history of|book club|police academy|walk hard|"
+    r"ace ventura|bridget jones|impractical jokers|absolutely fabulous|"
+    r"another gay|playing with|puppet master|operation fortune|quantum leap|"
+    r"resident evil|mission impossible|fast and furious|john wick|"
+    r"airplane|robin hood|lost boys|jackass|mr\.?\s*monk|behind the mask|"
+    r"to all the boys|pathological"
+    r")\b"
+    r"|\b(?:the\s+)?movie\b|\bsequel\b|\bvol\.?\b|\bvolume\b|\bepisode\b|"
+    r"\bpart\s+\d\b"
+)
+_EPISODEISH_TITLE = re.compile(
+    r"(?i)\bS\d{1,2}(?:E\d{1,3}|EX\w*|M\d+)\b|"
+    r"\bgag reel\b|\bsizzle reel\b|\bdeleted scenes?\b|"
+    r"\binside the episode\b|\bcharacter retrospectives?\b"
+)
+_MISPLACED_DETAIL = re.compile(
+    r"Misplaced in ([^;]+); move to ([^.]+)",
+    re.IGNORECASE,
+)
+# Release-group clutter in a folder name — the only in-place rename we propose.
+_RELEASE_FOLDER_JUNK = re.compile(
+    r"(?i)(?:"
+    r"[\[({][^\[\](){}]{0,40}\b(?:1080p|720p|2160p|480p|4k|webrip|web-?dl|bluray|"
+    r"bdrip|dvdrip|hdtv|yts\.?mx|yts\.?am|yify|rarbg|x264|x265|hevc|10bit|"
+    r"aac|dts|truehd|atmos|remux|proper|repack|amzn|nf|hulu)\b"
+    r"|"
+    r"\b(?:1080p|720p|2160p|webrip|web-?dl|bluray|yts|yify|rarbg)\b"
+    r")"
+)
+# Prefer keeping "This Is 40 (2012)" / "Rush Hour 3 (2007)" when stripping junk.
+_TITLE_YEAR_HEAD = re.compile(
+    r"^(?P<head>.+?\(\d{4}\))"
+    r"(?P<junk>\s*[\[({].*)$",
+    re.IGNORECASE,
+)
+_COLLECTION_PACK = re.compile(
+    r"(?i)\b(?:complete|collection|trilogy|quadrilogy|filmography|anthology)\b"
+    r"|\d{4}\s*[-–]\s*\d{4}"
+)
+# Extra release tokens cleaned_title may leave on dotted folder names.
+_LAYOUT_EXTRA_TAGS = frozenset({
+    "remastered", "restored", "criterion", "hybrid", "readnfo", "nfo",
+    "tgx", "publichd", "galaxyrg", "judas", "tigole", "mpc", "bokutox",
+})
+
 
 @dataclass(frozen=True)
 class Action:
@@ -98,6 +199,8 @@ class Action:
     status: str = "pending"
     bucket: str | None = None
     confidence: str = "plex"  # plex = same metadata item; weak = title heuristic
+    keep_height: int | None = None
+    source_height: int | None = None
 
     def as_row(self) -> dict:
         return asdict(self)
@@ -194,25 +297,39 @@ def bucket_of(path: Path | str, buckets: dict[str, tuple[Path, ...]]) -> str | N
 def classify_copy(copy: Copy, genres: set[str] | None = None) -> str | None:
     """Return a bucket family hint: kids/anime/christmas/documentary/standup/workouts/movies/shows."""
     tags = {tag.lower() for tag in (genres or set())}
-    for tag in tags:
-        mapped = GENRE_BUCKETS.get(tag)
-        if mapped:
-            if mapped == "kids":
-                return "kids_shows" if copy.kind == "episode" else "kids_movies"
-            if mapped == "anime":
-                return "anime_shows" if copy.kind == "episode" else "anime_movies"
-            return mapped
-    # Title heuristics for christmas / standup / workout when genres are thin.
+    episode = copy.kind == "episode" or copy.season is not None
     title = " ".join(
         part for part in [(copy.show or ""), copy.title] if part
     ).lower()
-    if "christmas" in title or "holiday" in title:
-        return "christmas"
-    if "standup" in title or "stand-up" in title or "stand up" in title:
+
+    # Fixed priority — Plex often tags standup specials as Documentary (+ Comedy).
+    if tags & _STANDUP_TAGS:
         return "standup"
-    if "workout" in title or "fitness" in title:
+    if "anime" in tags:
+        return "anime_shows" if episode else "anime_movies"
+    if tags & _KIDS_EXPLICIT or ("family" in tags and "animation" in tags):
+        return "kids_shows" if episode else "kids_movies"
+    # Holiday genre on movies only; never from bare "holiday" in a title
+    # (Roman Holiday is a romance, not Christmas).
+    if not episode and (tags & _CHRISTMAS_TAGS or "christmas" in title):
+        return "christmas"
+    # Plex often tags standup specials as Documentary + Comedy. Require both
+    # plus a person-name title — comedy alone + "Foo: Bar" yanked Star Wars etc.
+    if (
+        not episode
+        and tags & _DOC_TAGS
+        and "comedy" in tags
+        and _looks_like_standup_special(title)
+    ):
+        return "standup"
+    if tags & _DOC_TAGS:
+        return "documentary"
+    if tags & _WORKOUT_TAGS or "workout" in title or "fitness" in title:
         return "workouts"
-    if copy.kind == "episode":
+    # Episode/extra-shaped titles sitting in a movie library.
+    if not episode and _EPISODEISH_TITLE.search(title):
+        return "shows"
+    if episode:
         return "shows"
     if copy.kind == "movie":
         return "movies"
@@ -246,6 +363,7 @@ def audit(
     upgrade_paths: set[str] | None = None,
     free_of=None,
     margin: int = 0,
+    prior_moves: list[dict] | None = None,
 ) -> tuple[list[Action], list[str]]:
     """Scan copies and return proposed actions + space summary notes."""
     notes: list[str] = []
@@ -265,8 +383,16 @@ def audit(
         _duplicate_actions(copies, plex_db, buckets, upgrade_paths)
     )
     actions.extend(_orphan_actions(copies, plex_known, sections, roots))
+    recovered = _recovery_actions(
+        copies, buckets, prior_moves or (), free_of, margin,
+    )
+    actions.extend(recovered)
+    recovered_keys = {path_key(action.source) for action in recovered if action.source}
     actions.extend(
-        _misplaced_actions(copies, buckets, genres_by_path, free_of, margin)
+        _misplaced_actions(
+            copies, buckets, genres_by_path, free_of, margin,
+            skip_paths=recovered_keys,
+        )
     )
     actions.extend(_layout_actions(copies, buckets))
     notes.extend(_space_notes(buckets, free_of))
@@ -305,11 +431,20 @@ def apply_action(
     free_of=None,
     margin: int = 0,
     recycle: bool | None = None,
+    upgrade_paths: set[str] | None = None,
 ) -> str:
     """Apply one pending tidy action. Returns a user-facing message."""
     kind = str(row.get("kind") or "")
     if kind == "trash":
-        return _apply_trash(row, roots, trash_dir, plex, library, recycle=recycle)
+        return _apply_trash(
+            row,
+            roots,
+            trash_dir,
+            plex,
+            library,
+            recycle=recycle,
+            upgrade_paths=upgrade_paths,
+        )
     if kind == "scan":
         return _apply_scan(row, plex, roots)
     if kind in {"move", "rename"}:
@@ -369,7 +504,29 @@ def format_report(
         lines.append(_action_line(row, index=index))
     extra = len(pending) - len(shown)
     if extra > 0:
-        lines.append(f"…and {extra} more (indexes continue after this page on re-audit)")
+        # Break down the hidden tail so "24710 more" is not mistaken for more moves.
+        rest = pending[limit:]
+        rest_counts: dict[str, int] = {}
+        blocked_rest = 0
+        for row in rest:
+            if row.get("status") == "blocked":
+                blocked_rest += 1
+                continue
+            kind = str(row.get("kind") or "?")
+            rest_counts[kind] = rest_counts.get(kind, 0) + 1
+        parts = [
+            f"{count} {kind}"
+            for kind, count in sorted(
+                rest_counts.items(), key=lambda item: PRIORITY.get(item[0], 99),
+            )
+        ]
+        if blocked_rest:
+            parts.append(f"{blocked_rest} blocked")
+        detail = ", ".join(parts) if parts else "actions"
+        lines.append(
+            f"…and {extra} more ({detail}; showing first {limit} — "
+            f"use apply moves 1-20 / renames 50; indexes continue on re-audit)"
+        )
     if notes:
         lines.append("")
         lines.extend(notes)
@@ -410,28 +567,42 @@ def _duplicate_actions(
         by_item = plex_parts_by_item(plex_db)
         height_by_path = {path_key(copy.path): copy.height for copy in copies}
         for item_id, parts in by_item.items():
-            if len(parts) < 2:
+            # Plex often keeps stale media_parts; only rank files that still exist.
+            live = [
+                (path, height)
+                for path, height in parts
+                if _regular_library_file(path)
+            ]
+            if len(live) < 2:
                 continue
             ranked = []
-            for path, height in parts:
+            for path, height in live:
                 ranked.append(
                     (
+                        0 if _looks_like_extra(path) else 1,
                         height or height_by_path.get(path) or 0,
                         _file_size(path),
                         _bucket_rank(path, buckets),
                         path,
                     )
                 )
-            ranked.sort(key=lambda row: (row[0], row[1], -row[2]), reverse=True)
-            winner = ranked[0][3]
+            ranked.sort(
+                key=lambda row: (row[0], row[1], row[2], -row[3]),
+                reverse=True,
+            )
+            winner = ranked[0][4]
+            winner_height = ranked[0][1]
             # Refuse auto-trash when no copy has a known height — size alone is a weak signal.
-            if not any(height for height, _size, _rank, _path in ranked):
+            if not any(height for _main, height, _size, _rank, _path in ranked):
                 continue
-            for height, _size, _rank, loser in ranked[1:]:
-                if loser in upgrade_paths or path_key(loser) in covered:
+            for _main, height, _size, _rank, loser in ranked[1:]:
+                loser_key = path_key(loser)
+                if loser_key in upgrade_paths or loser_key in covered:
                     continue
                 # Require a known, strictly lower height — never trash on size alone.
-                if not height or height >= (ranked[0][0] or 0):
+                if not height or height >= (winner_height or 0):
+                    continue
+                if not _duplicate_pair_ok(winner, loser):
                     continue
                 covered.add(path_key(loser))
                 label = _label_for_path(copies, loser) or Path(loser).stem
@@ -443,12 +614,14 @@ def _duplicate_actions(
                         title=str(label),
                         detail=(
                             f"Duplicate on same Plex item #{item_id}. "
-                            f"Keep {ranked[0][0]}p, trash {height}p copy."
+                            f"Keep {winner_height}p, trash {height}p copy."
                         ),
                         source=loser,
                         keep=winner,
                         status="pending",
                         confidence="plex",
+                        keep_height=int(winner_height),
+                        source_height=int(height),
                     )
                 )
 
@@ -466,14 +639,20 @@ def _duplicate_actions(
         if len(unique) < 2:
             continue
         ranked = sorted(
-            unique.values(),
+            [
+                copy for copy in unique.values()
+                if _regular_library_file(copy.path)
+            ],
             key=lambda copy: (
+                0 if _looks_like_extra(copy.path) else 1,
                 copy.height or 0,
                 _file_size(copy.path),
                 -_bucket_rank(copy.path, buckets),
             ),
             reverse=True,
         )
+        if len(ranked) < 2:
+            continue
         winner = ranked[0]
         if not any(copy.height for copy in ranked):
             continue
@@ -482,6 +661,8 @@ def _duplicate_actions(
             if loser_key in covered or loser_key in upgrade_paths:
                 continue
             if not loser.height or not winner.height or loser.height >= winner.height:
+                continue
+            if not _duplicate_pair_ok(winner.path, loser.path):
                 continue
             covered.add(loser_key)
             # Title-only matches can collide; keep pending but mark weak so
@@ -501,6 +682,8 @@ def _duplicate_actions(
                     keep=winner.path,
                     status="pending",
                     confidence="weak",
+                    keep_height=int(winner.height),
+                    source_height=int(loser.height),
                 )
             )
     return actions
@@ -567,61 +750,262 @@ def _misplaced_actions(
     genres_by_path: dict[str, set[str]],
     free_of,
     margin: int,
+    skip_paths: set[str] | None = None,
 ) -> list[Action]:
     actions = []
+    skip_paths = skip_paths or set()
     for copy in copies:
+        if path_key(copy.path) in skip_paths:
+            continue
+        if _in_trash_tree(copy.path):
+            continue
         current = bucket_of(copy.path, buckets)
+        # Outside configured library roots (Downloads/Documents/…) — not tidy.
+        if current is None:
+            continue
+        # Extras/featurettes stay with the parent show tree.
+        if _looks_like_extra(copy.path):
+            continue
         wanted = classify_copy(copy, genres_by_path.get(path_key(copy.path)))
         if not wanted or wanted not in buckets:
             continue
         if current == wanted:
             continue
-        roots = buckets.get(wanted) or ()
-        if not roots:
+        # Trust intentional specialized shelves entirely (christmas/kids/anime/…).
+        if current in _SPECIALIZED_BUCKETS:
             continue
-        size = _file_size(copy.path)
-        dest_root = _pick_root(roots, size, margin, free_of)
-        if dest_root is None:
+        # Show shelves keep extras, holiday episodes, and documentary/standup
+        # clips with the series. Only allow show→show rehomes (kids/anime).
+        if current in _SHOW_FAMILY and wanted not in _SHOW_FAMILY:
+            continue
+        if copy.kind == "episode" and wanted not in _SHOW_FAMILY:
+            continue
+        action = _propose_move(copy, current, wanted, buckets, free_of, margin)
+        if action is not None:
+            actions.append(action)
+    return actions
+
+
+def _recovery_actions(
+    copies: list[Copy],
+    buckets: dict[str, tuple[Path, ...]],
+    prior_moves: list[dict] | tuple[dict, ...],
+    free_of,
+    margin: int,
+) -> list[Action]:
+    """Undo earlier tidy moves that current policy would refuse.
+
+    Yesterday's shows→movies / kids→shows / standup→movies applies left extras
+    and specials in the wrong shelf; propose putting them back.
+    """
+    by_path = {path_key(copy.path): copy for copy in copies}
+    # After layout renames, the ledger dest path may no longer exist — find the
+    # same filename still sitting in the destination bucket.
+    by_bucket_name: dict[tuple[str, str], list[Copy]] = {}
+    for copy in copies:
+        bucket = bucket_of(copy.path, buckets)
+        if not bucket:
+            continue
+        key = (bucket, Path(copy.path).name.casefold())
+        by_bucket_name.setdefault(key, []).append(copy)
+    actions: list[Action] = []
+    seen: set[str] = set()
+    for row in prior_moves:
+        if row.get("kind") != "move" or row.get("status") != "done":
+            continue
+        detail = str(row.get("detail") or "")
+        matched = _MISPLACED_DETAIL.search(detail)
+        if not matched:
+            continue
+        from_bucket = matched.group(1).strip().lower()
+        to_bucket = matched.group(2).strip().lower()
+        original_source = str(row.get("source") or "")
+        current_path = str(row.get("dest") or "")
+        if not current_path:
+            continue
+        copy = by_path.get(path_key(current_path))
+        # Basename fallback when ledger dest was renamed after the move.
+        # Require parent-folder overlap under generic shelves so common names
+        # like Gag Reel.mkv cannot bind the wrong file.
+        if copy is None and (
+            to_bucket in _SPECIALIZED_BUCKETS
+            or from_bucket in _SPECIALIZED_BUCKETS
+        ):
+            candidates = by_bucket_name.get(
+                (to_bucket, Path(current_path).name.casefold())
+            ) or []
+            dest_folder = Path(current_path).parent.name.casefold()
+            if to_bucket in _SPECIALIZED_BUCKETS and len(candidates) == 1:
+                copy = candidates[0]
+            else:
+                ranked = [
+                    item for item in candidates
+                    if dest_folder
+                    and dest_folder in Path(item.path).parent.name.casefold()
+                ]
+                copy = ranked[0] if len(ranked) == 1 else None
+        if copy is None:
+            continue
+        if path_key(copy.path) in seen:
+            continue
+        if _in_trash_tree(copy.path):
+            continue
+        title = " ".join(
+            part for part in [(copy.show or ""), copy.title] if part
+        )
+        if not _should_undo_move(
+            from_bucket,
+            to_bucket,
+            original_source,
+            title,
+            copy=copy,
+        ):
+            continue
+        if from_bucket not in buckets:
+            continue
+        current = bucket_of(copy.path, buckets)
+        if current == from_bucket:
+            continue
+        # Prefer the exact original path when the parent folder still exists.
+        orig = Path(original_source) if original_source else None
+        if orig is not None and orig.parent.exists():
+            dest = orig
+            if path_key(dest) == path_key(copy.path):
+                continue
             actions.append(
                 Action(
-                    id=action_id("move-blocked", copy.path, wanted),
-                    kind="report",
-                    priority=PRIORITY["report"],
+                    id=action_id("undo-move", copy.path, from_bucket),
+                    kind="move",
+                    priority=PRIORITY["move"],
                     title=copy.label,
-                    detail=f"Belongs in {wanted}, but no drive has enough free space.",
+                    detail=f"Undo bad tidy move; return to {from_bucket}.",
                     source=copy.path,
-                    bucket=wanted,
-                    status="blocked",
+                    dest=str(dest),
+                    bucket=from_bucket,
+                    status="pending",
                 )
             )
+            seen.add(path_key(copy.path))
             continue
-        dest = expected_path(copy, dest_root)
-        if dest is None:
-            continue
-        if path_key(dest) == path_key(copy.path):
-            continue
-        actions.append(
-            Action(
-                id=action_id("move", copy.path, dest),
-                kind="move",
-                priority=PRIORITY["move"],
-                title=copy.label,
-                detail=f"Misplaced in {current or 'unknown'}; move to {wanted}.",
-                source=copy.path,
-                dest=str(dest),
-                bucket=wanted,
-                status="pending",
-            )
+        action = _propose_move(
+            copy, current or to_bucket, from_bucket, buckets, free_of, margin,
+            detail=f"Undo bad tidy move; return to {from_bucket}.",
+            id_prefix="undo-move",
         )
+        if action is not None:
+            actions.append(action)
+            seen.add(path_key(copy.path))
     return actions
+
+
+def _should_undo_move(
+    from_bucket: str,
+    to_bucket: str,
+    original_source: str,
+    title: str,
+    *,
+    copy: Copy | None = None,
+) -> bool:
+    if from_bucket == to_bucket:
+        return False
+    # Never should have left an intentional specialized shelf.
+    if from_bucket in _SPECIALIZED_BUCKETS:
+        return True
+    # Comedy "Title: Subtitle" false positives dumped features into Standup.
+    if to_bucket == "standup" and from_bucket in {
+        "movies", "shows", "kids_movies", "anime_movies",
+    }:
+        if copy is not None and (
+            copy.kind == "episode" or copy.season is not None
+        ):
+            return True
+        return not _looks_like_standup_special(title)
+    # Show→movies (etc.) only when the original path/title looks like an extra
+    # or episode — do not yank real features that lived under Shows.
+    if from_bucket in _SHOW_FAMILY and to_bucket not in _SHOW_FAMILY:
+        if copy is not None and (
+            copy.kind == "episode" or copy.season is not None
+        ):
+            return True
+        return bool(
+            _looks_like_extra(original_source)
+            or _EPISODEISH_TITLE.search(title or "")
+            or _EPISODEISH_TITLE.search(original_source or "")
+        )
+    return False
+
+
+def _looks_like_standup_special(title: str) -> bool:
+    text = (title or "").strip()
+    if not text or "concert" in text.casefold():
+        return False
+    if _NOT_STANDUP_TITLE.search(text):
+        return False
+    return bool(_STANDUP_SPECIAL.search(text))
+
+
+def _propose_move(
+    copy: Copy,
+    current: str | None,
+    wanted: str,
+    buckets: dict[str, tuple[Path, ...]],
+    free_of,
+    margin: int,
+    *,
+    detail: str | None = None,
+    id_prefix: str = "move",
+) -> Action | None:
+    roots = buckets.get(wanted) or ()
+    if not roots:
+        return None
+    size = _file_size(copy.path)
+    dest_root = _pick_root(roots, size, margin, free_of)
+    if dest_root is None:
+        return Action(
+            id=action_id(f"{id_prefix}-blocked", copy.path, wanted),
+            kind="report",
+            priority=PRIORITY["report"],
+            title=copy.label,
+            detail=f"Belongs in {wanted}, but no drive has enough free space.",
+            source=copy.path,
+            bucket=wanted,
+            status="blocked",
+        )
+    dest = expected_path(copy, dest_root)
+    if dest is None:
+        return None
+    if path_key(dest) == path_key(copy.path):
+        return None
+    return Action(
+        id=action_id(id_prefix, copy.path, dest),
+        kind="move",
+        priority=PRIORITY["move"],
+        title=copy.label,
+        detail=detail or f"Misplaced in {current or 'unknown'}; move to {wanted}.",
+        source=copy.path,
+        dest=str(dest),
+        bucket=wanted,
+        status="pending",
+    )
 
 
 def _layout_actions(
     copies: list[Copy],
     buckets: dict[str, tuple[Path, ...]],
 ) -> list[Action]:
+    """Propose conservative in-place renames only.
+
+    Full Plex-style rewrites (strip episode titles, drop show years, pad seasons)
+    are too lossy for an existing library. Only clean clear release-group folder
+    clutter on movies, and keep the original filename.
+    """
     actions = []
     for copy in copies:
+        if _looks_like_extra(copy.path) or _in_trash_tree(copy.path):
+            continue
+        # Episodes keep their titles/years/season wording — do not rewrite.
+        if copy.kind == "episode" or copy.season is not None:
+            continue
         current_bucket = bucket_of(copy.path, buckets)
         if not current_bucket:
             continue
@@ -629,7 +1013,7 @@ def _layout_actions(
         root = _root_for(Path(copy.path), roots)
         if root is None:
             continue
-        expected = expected_path(copy, root)
+        expected = _gentle_movie_layout_dest(copy, root)
         if expected is None:
             continue
         if path_key(expected) == path_key(copy.path):
@@ -643,8 +1027,8 @@ def _layout_actions(
                     priority=PRIORITY["report"],
                     title=copy.label,
                     detail=(
-                        f"Messy layout under {root.name}, but normalized path "
-                        f"already exists: {expected.name}"
+                        f"Release clutter under {root.name}, but clean folder "
+                        f"already exists: {expected.parent.name}"
                     ),
                     source=copy.path,
                     dest=str(expected),
@@ -659,7 +1043,10 @@ def _layout_actions(
                 kind="rename",
                 priority=PRIORITY["rename"],
                 title=copy.label,
-                detail=f"Messy layout under {root.name}; normalize folder/name.",
+                detail=(
+                    f"Release clutter under {root.name}; "
+                    f"clean folder name (keep filename)."
+                ),
                 source=copy.path,
                 dest=str(expected),
                 bucket=current_bucket,
@@ -667,6 +1054,148 @@ def _layout_actions(
             )
         )
     return actions
+
+
+def _gentle_movie_layout_dest(copy: Copy, root: Path) -> Path | None:
+    """Return a cleaned movie path only when the parent folder has release junk.
+
+    Keeps the original filename. Prefers stripping junk from the existing
+    ``Title (Year) [YTS…]`` folder so numbers like ``This Is 40`` / ``Rush Hour 3``
+    survive. Falls back to Plex title only for dotted release folders.
+    """
+    path = Path(copy.path)
+    parent = path.parent
+    name = path.name.casefold()
+    if name.startswith("extra ") or name.startswith("extras ") or name.startswith("extra."):
+        return None
+    try:
+        under_root = parent == root or root in parent.parents
+    except (OSError, ValueError):
+        under_root = False
+    if not under_root:
+        return None
+    # Multi-movie packs — leave alone (would peel one title out of the set).
+    if _COLLECTION_PACK.search(parent.name):
+        return None
+    directly_under_root = parent == root
+    junk_folder = _RELEASE_FOLDER_JUNK.search(parent.name) is not None
+    # Loose files on the bucket root: only act when the filename itself has
+    # release clutter (do not wrap an already-clean Title (Year).mkv).
+    junk_name = (
+        _RELEASE_FOLDER_JUNK.search(path.name) is not None
+        or _title_looks_like_release(path.stem)
+    )
+    if directly_under_root:
+        if not junk_name:
+            return None
+    elif not junk_folder:
+        return None
+
+    stripped = None if directly_under_root else _strip_release_junk_folder(parent.name)
+    if stripped:
+        clean_folder = safe_name(stripped)
+    else:
+        # Dotted release folder or file on the root. Prefer a clean Plex title
+        # (keeps "This Is 40"); humanize when Plex itself stored a release dump.
+        label = Label(
+            "movie",
+            _layout_movie_title(copy, path, directly_under_root=directly_under_root),
+            copy.year,
+        )
+        clean_folder = movie_folder(label)
+
+    base = root if directly_under_root else parent.parent
+    try:
+        if base != root and root not in base.parents:
+            return None
+    except (OSError, ValueError):
+        return None
+    # Avoid Title (Year)/Title (Year)/file when junk sat under an already-clean folder.
+    if path_key(base.name) == path_key(clean_folder):
+        return base / path.name
+    dest = base / clean_folder / path.name
+    if path_key(dest) == path_key(path):
+        return None
+    return dest
+
+
+def _strip_release_junk_folder(name: str) -> str | None:
+    """Return ``Title (Year)`` when ``name`` is that plus release brackets/tags."""
+    text = (name or "").strip()
+    if not text or not _RELEASE_FOLDER_JUNK.search(text):
+        return None
+    matched = _TITLE_YEAR_HEAD.match(text)
+    if not matched:
+        return None
+    head = matched.group("head").strip()
+    junk = matched.group("junk") or ""
+    if not head or not junk.strip():
+        return None
+    if path_key(head) == path_key(text):
+        return None
+    return head
+
+
+def _layout_movie_title(
+    copy: Copy,
+    path: Path,
+    *,
+    directly_under_root: bool = False,
+) -> str:
+    """Folder title for dotted release layouts; keep sequel digits."""
+    raw = (copy.title or "").strip()
+    if raw and not _title_looks_like_release(raw):
+        return raw
+    # Never seed from the bucket root name (e.g. "Movies") when the file sits
+    # directly under it — use the filename stem instead.
+    if directly_under_root:
+        seed = raw or path.stem
+    else:
+        seed = raw or path.parent.name or path.stem
+    return _humanize_release_title(seed) or raw or path.stem
+
+
+def _title_looks_like_release(text: str) -> bool:
+    if _RELEASE_FOLDER_JUNK.search(text):
+        return True
+    # Some.Like.It.Hot.1959.REMASTERED.1080p…
+    if text.count(".") >= 2 and YEAR.search(text):
+        return True
+    return False
+
+
+def _humanize_release_title(text: str) -> str:
+    """Strip release tokens; keep short digit words (3, 40) unlike cleaned_title."""
+    work = (text or "").strip()
+    suffix = Path(work).suffix.lower()
+    if suffix in VIDEO_EXTENSIONS:
+        work = work[: -len(suffix)]
+    work = YEAR.sub(" ", work)
+    work = re.sub(r"\[[^\]]*\]", " ", work)
+    work = re.sub(r"\{[^}]*\}", " ", work)
+    work = re.sub(r"[._]+", " ", work)
+    kept: list[str] = []
+    for word in work.split():
+        token = word.strip(" -()[]")
+        if not token:
+            continue
+        lower = token.lower()
+        if lower in TAGS or lower in _LAYOUT_EXTRA_TAGS:
+            continue
+        if lower in RESOLUTION_NUMBERS or f".{lower}" in VIDEO_EXTENSIONS:
+            continue
+        parts = [part for part in re.split(r"[-]+", lower) if part]
+        if parts and all(
+            part in TAGS or part in _LAYOUT_EXTRA_TAGS or part in RESOLUTION_NUMBERS
+            for part in parts
+        ):
+            continue
+        # Drop pure digit tokens only when they are resolution heights.
+        if token.isdigit() and token in RESOLUTION_NUMBERS:
+            continue
+        kept.append(token)
+    title = re.sub(r"\s+", " ", " ".join(kept)).strip(" -")
+    return title
 
 
 def _space_notes(buckets: dict[str, tuple[Path, ...]], free_of) -> list[str]:
@@ -695,21 +1224,38 @@ def _space_notes(buckets: dict[str, tuple[Path, ...]], free_of) -> list[str]:
     return lines if len(lines) > 1 else []
 
 
-def _apply_trash(row, roots, trash_dir, plex, library, recycle=None) -> str:
+def _apply_trash(
+    row, roots, trash_dir, plex, library, recycle=None, upgrade_paths=None,
+) -> str:
     source = Path(str(row.get("source") or ""))
     keep = str(row.get("keep") or "")
     if not keep:
         raise OSError("Duplicate trash requires a keep path.")
     keep_path = Path(keep)
     # Re-validate ledger paths at apply time (do not trust a tampered tidy.json).
-    _assert_safe_library_file(keep_path, roots)
-    _assert_safe_library_file(source, roots)
+    _assert_safe_library_file(keep_path, roots, label="Keep path")
+    _assert_safe_library_file(source, roots, label="Source path")
     if path_key(source) == path_key(keep_path):
         raise OSError("Duplicate trash source and keep path must differ.")
-    # Prefer trashing the smaller/weaker file if a ledger row was swapped.
-    if _file_size(source) > _file_size(keep_path):
+    claimed = {path_key(path) for path in (upgrade_paths or set())}
+    if path_key(source) in claimed or path_key(keep_path) in claimed:
         raise OSError(
-            "Refusing to trash a larger file than the keep path; re-run /tidy."
+            "That file is claimed by an active upgrade; finish /drop or /keep, then re-run /tidy."
+        )
+    if not _duplicate_pair_ok(str(keep_path), str(source)):
+        raise OSError(
+            "Keep/source no longer look like the same title; re-run /tidy."
+        )
+    # Prefer live filename tags; fall back to Plex heights stored at audit time.
+    keep_height = video_height(keep_path.name) or _row_height(row.get("keep_height"))
+    source_height = video_height(source.name) or _row_height(row.get("source_height"))
+    if not keep_height or not source_height:
+        raise OSError(
+            "Could not re-verify resolution for this duplicate; re-run /tidy."
+        )
+    if source_height >= keep_height:
+        raise OSError(
+            "Source is no longer lower resolution than keep; re-run /tidy."
         )
     dest = move_to_trash(
         source,
@@ -786,34 +1332,152 @@ def _apply_move(row, roots, plex, library, free_of, margin) -> str:
     _assert_safe_library_file(source, roots)
     if not under_roots(dest, roots):
         raise OSError("Refusing to move outside the library roots.")
-    shutil.move(str(source), str(dest))
+    # Cross-disk moves copy then delete; Ctrl+C mid-copy can leave a partial dest.
+    try:
+        shutil.move(str(source), str(dest))
+    except BaseException:
+        _cleanup_partial_dest(source, dest)
+        raise
     if not under_roots(dest, roots):
         raise OSError("Move escaped the library roots.")
     _prune_empty_parents(source.parent, roots)
+    if library is not None:
+        # Update the in-memory index before Plex scan so a SQLite blip cannot
+        # leave the move unmarked after the file is already relocated.
+        library.remember_move(source, dest)
     parents = [source.parent, dest.parent]
     notes = []
     if plex is not None:
-        notes, _refreshed = plex.refresh_dirs(parents)
-    if library is not None:
-        library.note_files([dest])
-        library.invalidate()
+        try:
+            notes, _refreshed = plex.refresh_dirs(parents)
+        except OSError as exc:
+            # Keep the move; Plex can catch up on the next scan.
+            notes = [f"Moved, but Plex scan failed: {exc}"]
     message = f"Moved:\n{source}\n→ {dest}"
     if notes:
         message += "\n" + "\n".join(notes)
     return message
 
 
-def _assert_safe_library_file(source: Path, roots) -> None:
+def _cleanup_partial_dest(source: Path, dest: Path) -> None:
+    """Remove an incomplete cross-disk copy when source is still present."""
+    try:
+        if not source.exists() or not dest.exists():
+            return
+        if path_key(source) == path_key(dest):
+            return
+        dest.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _assert_safe_library_file(source: Path, roots, *, label: str = "Library file") -> None:
     try:
         info = source.lstat()
     except OSError as exc:
-        raise OSError("Library file is missing.") from exc
+        raise OSError(f"{label} is missing.") from exc
     if stat.S_ISLNK(info.st_mode):
         raise OSError("Refusing to move a symlink.")
     if not stat.S_ISREG(info.st_mode):
         raise OSError("Refusing to move a non-regular library path.")
     if not under_roots(source, roots):
         raise OSError("Refusing to move a file outside the library roots.")
+
+
+def _row_height(value) -> int | None:
+    try:
+        height = int(value)
+    except (TypeError, ValueError):
+        return None
+    return height if height > 0 else None
+
+
+def _regular_library_file(path: str | Path) -> bool:
+    try:
+        info = Path(path).lstat()
+    except OSError:
+        return False
+    return stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode)
+
+
+def _looks_like_extra(path: str | Path) -> bool:
+    """True for extras/bonus folders or after-show style filenames."""
+    text = str(path).replace("/", "\\")
+    parts = [part for part in text.split("\\") if part]
+    for part in parts[:-1]:
+        lowered = part.strip().casefold()
+        if lowered in _EXTRA_DIR_NAMES or lowered.startswith("season ") and "extra" in lowered:
+            return True
+        if "after-show" in lowered or "bonus" in lowered:
+            return True
+    name = (parts[-1] if parts else "").casefold()
+    return any(marker in name for marker in _EXTRA_NAME_MARKERS)
+
+
+def _in_trash_tree(path: str | Path) -> bool:
+    """True when a path segment is a trash/recycle folder (never rehome those)."""
+    for part in Path(path).parts:
+        lowered = part.strip().casefold()
+        if lowered in {"_trash", "trash", "$recycle.bin", "recycle.bin"}:
+            return True
+    return False
+
+
+def _duplicate_pair_ok(keep: str | Path, loser: str | Path) -> bool:
+    """Reject Plex same-item pairs that are clearly different titles/extras.
+
+    Title similarity uses **filenames only** — full paths pollute tokens with the
+    show folder name and make unrelated episodes look related.
+    """
+    keep_s = str(keep)
+    loser_s = str(loser)
+    keep_extra = _looks_like_extra(keep_s)
+    loser_extra = _looks_like_extra(loser_s)
+    # Never trash a main library file just to keep an extras/bonus clip.
+    if keep_extra and not loser_extra:
+        return False
+    # Stem only — extensions like ".avi" must not count as title overlap.
+    keep_name = parse_request(Path(keep_s).stem)
+    loser_name = parse_request(Path(loser_s).stem)
+    keep_season, keep_episode = _season_episode(keep_s, keep_name)
+    loser_season, loser_episode = _season_episode(loser_s, loser_name)
+    if (
+        keep_season is not None
+        and keep_episode is not None
+        and loser_season is not None
+        and loser_episode is not None
+        and (keep_season, keep_episode) != (loser_season, loser_episode)
+    ):
+        return False
+    keep_tokens = set(keep_name.tokens)
+    loser_tokens = set(loser_name.tokens)
+    # Both opaque: allow. One-sided opaque vs titled: treat as no overlap.
+    if not keep_tokens and not loser_tokens:
+        return True
+    overlap = keep_tokens & loser_tokens
+    if not overlap:
+        return False
+    # If each filename has its own exclusive title words, they are different
+    # episodes even when they share show tokens (Doctor Who "cosmic time" vs
+    # "firemaker", both tagged S01E04 on the same Plex item).
+    keep_only = keep_tokens - loser_tokens
+    loser_only = loser_tokens - keep_tokens
+    if keep_only and loser_only:
+        return False
+    union = keep_tokens | loser_tokens
+    # Sparse vs verbose names that only share a show word (low Jaccard).
+    if len(union) >= 4 and (len(overlap) / len(union)) <= 0.4:
+        return False
+    return True
+
+
+def _season_episode(path: str, parsed: Request) -> tuple[int | None, int | None]:
+    if parsed.season is not None and parsed.episode is not None:
+        return parsed.season, parsed.episode
+    fuller = parse_request(path.replace("\\", " ").replace("/", " "))
+    if fuller.season is not None and fuller.episode is not None:
+        return fuller.season, fuller.episode
+    return parsed.season, parsed.episode
 
 
 def _prune_empty_parents(start: Path, roots) -> None:

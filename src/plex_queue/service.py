@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import logging
+import sqlite3
 import threading
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 from plex_queue.decide import AlreadyHave, Enqueue, NoUpgrade, NothingFound, UnknownQuality, decide
 from plex_queue.errors import public_error
@@ -762,6 +766,146 @@ class Service:
         self.library.refresh()
         return "Library reread.\n" + "\n".join(self.library.notes)
 
+    def refresh_plex(
+        self,
+        user_id: int = 0,
+        progress=None,
+        *,
+        poll_seconds: int = 20,
+        max_wait_seconds: int = 5400,
+        min_wait_seconds: int = 600,
+        idle_polls: int = 9,
+        sleep=None,
+    ) -> str:
+        """Ask Plex to fully refresh every section, wait with status updates, then reread.
+
+        ``progress`` is an optional ``callable(str)`` for interim Telegram/CLI updates.
+        Waits at least ``min_wait_seconds`` (default 10m) and ``idle_polls`` quiet
+        polls (default ~3m at 20s) after scan activity so multi-section refreshes
+        are not declared done during gaps between libraries.
+        """
+        if self.access is None or not self.access.is_owner(user_id):
+            return "Only the owner can do that."
+        if self.plex is None:
+            return "Plex scan is not configured."
+        import time as _time
+
+        sleeper = sleep or _time.sleep
+
+        def report(message: str) -> None:
+            if progress is not None and message:
+                progress(message)
+
+        started = timed()
+        report("Stopping any in-progress scan and starting a full Plex refresh…")
+        notes, section_ids = self.plex.refresh_all()
+        kickoff = "\n".join(notes) if notes else "Refresh requested."
+        report(kickoff)
+        if section_ids:
+            report(
+                f"Watching Plex scan progress (about every {max(5, int(poll_seconds))}s; "
+                f"won't finish before {max(0, int(min_wait_seconds)) // 60}m)…"
+            )
+            self._wait_for_plex_scan(
+                report,
+                poll_seconds=poll_seconds,
+                max_wait_seconds=max_wait_seconds,
+                min_wait_seconds=min_wait_seconds,
+                idle_polls=idle_polls,
+                sleep=sleeper,
+            )
+        report("Rereading local Plex DB and drives…")
+        self.library.refresh()
+        notes.extend(self.library.notes)
+        emit(
+            "plex.refresh_all",
+            status="ok" if section_ids else "error",
+            user_id=user_id,
+            sections=len(section_ids),
+            duration_ms=duration_ms(started),
+        )
+        summary = ["Plex refresh request complete; local index reread."]
+        summary.extend(self.library.notes)
+        if not section_ids and notes:
+            return "\n".join(notes)
+        return "\n".join(summary)
+
+    def _wait_for_plex_scan(
+        self,
+        report,
+        *,
+        poll_seconds: int,
+        max_wait_seconds: int,
+        min_wait_seconds: int,
+        idle_polls: int,
+        sleep,
+    ) -> None:
+        from plex_queue.plexscan import format_scan_activities, is_scan_activity
+
+        interval = max(5, int(poll_seconds))
+        limit = max(interval, int(max_wait_seconds))
+        quiet_needed = max(3, int(idle_polls))
+        floor = max(0, int(min_wait_seconds))
+        seen_scan = False
+        idle_streak = 0
+        waited = 0
+        last_fingerprint = ""
+        while waited < limit:
+            sleep(interval)
+            waited += interval
+            try:
+                activities = self.plex.list_activities()
+            except Exception:
+                activities = None
+            if activities is None:
+                # Do not treat API failures as "scan finished".
+                report("Could not read Plex activity status; still waiting…")
+                continue
+            scans = [item for item in activities if is_scan_activity(item)]
+            if not scans:
+                if seen_scan:
+                    # Plex often gaps between sections; require quiet + min runtime.
+                    idle_streak += 1
+                    if idle_streak >= quiet_needed and waited >= floor:
+                        report("Plex library scan looks finished.")
+                        return
+                    if idle_streak >= quiet_needed:
+                        minutes, seconds = divmod(max(0, floor - waited), 60)
+                        report(
+                            "Scan is quiet; holding until the minimum wait elapses "
+                            f"({minutes}m {seconds}s left)…"
+                        )
+                    else:
+                        report(
+                            "No active library scan right now; waiting in case another "
+                            "section starts…"
+                        )
+                    continue
+                if waited >= max(floor, 60, interval * 2):
+                    report(
+                        "No scan activity reported yet after the minimum wait; "
+                        "continuing with a local reread (check Plex Activity)."
+                    )
+                    return
+                report("Waiting for Plex to start scanning…")
+                continue
+            seen_scan = True
+            idle_streak = 0
+            fingerprint = "|".join(
+                f"{item.title}:{item.subtitle}:{item.progress}" for item in scans[:6]
+            )
+            if fingerprint == last_fingerprint and waited % (interval * 2) != 0:
+                continue
+            last_fingerprint = fingerprint
+            minutes, seconds = divmod(waited, 60)
+            header = f"Plex scan still running ({minutes}m {seconds}s):"
+            body = format_scan_activities(activities)
+            report(f"{header}\n{body}" if body else header)
+        report(
+            f"Still scanning after {limit // 60} minutes; rereading the local index now. "
+            "Check Plex Activity for the rest."
+        )
+
     def tidy(self, user_id: int = 0, refresh: bool = True) -> str:
         if self.access is None or not self.access.is_owner(user_id):
             return "Only the owner can do that."
@@ -835,8 +979,9 @@ class Service:
                     library=self.library,
                     free_of=lambda path: int(shutil.disk_usage(path).free),
                     margin=self.import_margin,
+                    upgrade_paths=self._upgrade_paths(),
                 )
-            except OSError as exc:
+            except (OSError, sqlite3.Error) as exc:
                 self.tidy_ledger.mark(action_id, status="failed", error=public_error(exc))
                 emit(
                     "tidy.apply",
@@ -921,30 +1066,49 @@ class Service:
         ok = 0
         failed = 0
         failures: list[str] = []
-        for row in chosen:
-            action_id = str(row.get("id") or "")
-            try:
-                apply_action(
-                    row,
-                    roots=self.roots,
-                    trash_dir=self.trash_dir,
-                    plex=self.plex,
-                    library=self.library,
-                    free_of=lambda path: int(shutil.disk_usage(path).free),
-                    margin=self.import_margin,
-                )
-            except OSError as exc:
-                self.tidy_ledger.mark(action_id, status="failed", error=public_error(exc))
-                failed += 1
-                if len(failures) < 15:
-                    failures.append(f"{action_id}: failed — {public_error(exc)}")
-                continue
-            self.tidy_ledger.mark(action_id, status="done")
-            self.tidy_ledger.cancel_related(row.get("source"), except_id=action_id)
-            ok += 1
+        upgrade_paths = self._upgrade_paths()
+        interrupted = False
+        try:
+            for index, row in enumerate(chosen, start=1):
+                action_id = str(row.get("id") or "")
+                try:
+                    apply_action(
+                        row,
+                        roots=self.roots,
+                        trash_dir=self.trash_dir,
+                        plex=self.plex,
+                        library=self.library,
+                        free_of=lambda path: int(shutil.disk_usage(path).free),
+                        margin=self.import_margin,
+                        upgrade_paths=upgrade_paths,
+                    )
+                except KeyboardInterrupt:
+                    interrupted = True
+                    break
+                except (OSError, sqlite3.Error) as exc:
+                    self.tidy_ledger.mark(action_id, status="failed", error=public_error(exc))
+                    failed += 1
+                    if len(failures) < 15:
+                        failures.append(f"{action_id}: failed — {public_error(exc)}")
+                    continue
+                self.tidy_ledger.mark(action_id, status="done")
+                self.tidy_ledger.cancel_related(row.get("source"), except_id=action_id)
+                ok += 1
+                if index % 25 == 0 or index == len(chosen):
+                    log.info(
+                        "tidy apply progress: %s/%s ok=%s failed=%s",
+                        index, len(chosen), ok, failed,
+                    )
+        finally:
+            if self.library is not None and kinds & {"move", "rename", "trash"}:
+                # One stale-mark after the batch — not after every file.
+                self.library.invalidate()
         emit(
             "tidy.apply_batch",
-            status="ok" if failed == 0 else "partial",
+            status=(
+                "interrupted" if interrupted
+                else ("ok" if failed == 0 else "partial")
+            ),
             kinds=sorted(kinds),
             selector=selector or "all",
             requested=len(chosen),
@@ -953,7 +1117,13 @@ class Service:
             user_id=user_id,
             duration_ms=duration_ms(started),
         )
-        lines = [f"Applied {ok} action(s), {failed} failed (of {len(chosen)})."]
+        if interrupted:
+            lines = [
+                f"Interrupted (Ctrl+C) after {ok} applied, {failed} failed "
+                f"(of {len(chosen)} queued). Re-run to continue."
+            ]
+        else:
+            lines = [f"Applied {ok} action(s), {failed} failed (of {len(chosen)})."]
         if failures:
             lines.append("")
             lines.extend(failures)
@@ -988,18 +1158,26 @@ class Service:
         )
         return f"Skipped {len(chosen)} {'/'.join(sorted(kinds))} action(s)."
 
+    def _upgrade_paths(self) -> set[str]:
+        if self.ledger is None:
+            return set()
+        return upgrade_replace_paths(self.ledger.states())
+
     def _audit_actions(self):
-        upgrade_paths = set()
-        if self.ledger is not None:
-            upgrade_paths = upgrade_replace_paths(self.ledger.states())
+        prior_moves: list[dict] = []
+        if self.tidy_ledger is not None:
+            prior_moves = self.tidy_ledger.list(
+                statuses={"done"}, kinds={"move"},
+            )
         return audit(
             list(self.library.copies),
             plex_db=self.plex_db,
             buckets=self.tidy_buckets,
             roots=self.roots,
-            upgrade_paths=upgrade_paths,
+            upgrade_paths=self._upgrade_paths(),
             free_of=lambda path: int(shutil.disk_usage(path).free),
             margin=self.import_margin,
+            prior_moves=prior_moves,
         )
 
     def _ensure_library(self) -> None:

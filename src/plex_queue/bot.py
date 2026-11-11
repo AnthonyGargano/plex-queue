@@ -61,7 +61,8 @@ CHOOSE = InlineKeyboardMarkup(
 OWNER_HELP = """\
 /rm <id>  remove from Deluge and keep the files
 /rmdata <id>  remove from Deluge and delete the files
-/scan  reread Plex and the drives
+/scan  reread local Plex DB and the drives
+/refresh  stop any Plex scan, fully rescan every section (with progress), then reread
 /upgrades  lower-quality copies ready to retire after a confirmed upgrade
 /drop <id>  move that old copy to the Recycle Bin (Windows)
 /keep <id>  leave the old copy and clear it from the list
@@ -244,8 +245,55 @@ def build_application(config: Config, service: Service, access: Access, importer
     async def scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await allowed(update, owner_only=True):
             return
+        args = [part.lower() for part in (context.args or [])]
+        if args and args[0] in {"full", "plex", "all"}:
+            await _refresh_with_progress(update)
+            return
         await reply(update, "Reading Plex and the drives...")
         await reply(update, await _work(service.scan))
+
+    async def refresh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await allowed(update, owner_only=True):
+            return
+        await _refresh_with_progress(update)
+
+    async def _refresh_with_progress(update: Update) -> None:
+        import asyncio
+
+        uid = user_id(update) or 0
+        await reply(update, "Starting a full Plex refresh — I'll post progress here.")
+        loop = asyncio.get_running_loop()
+        updates: asyncio.Queue[str] = asyncio.Queue()
+
+        def progress(message: str) -> None:
+            if message:
+                loop.call_soon_threadsafe(updates.put_nowait, message)
+
+        task = asyncio.create_task(
+            asyncio.to_thread(lambda: service.refresh_plex(uid, progress=progress))
+        )
+        while True:
+            if task.done():
+                # Let call_soon_threadsafe progress callbacks land, then drain.
+                await asyncio.sleep(0)
+                while not updates.empty():
+                    await reply(update, updates.get_nowait())
+                await asyncio.sleep(0)
+                while not updates.empty():
+                    await reply(update, updates.get_nowait())
+                break
+            try:
+                message = await asyncio.wait_for(updates.get(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
+            await reply(update, message)
+        try:
+            final = task.result()
+        except Exception:
+            log.exception("refresh failed")
+            final = "Something went wrong. The details are in the bot log."
+        if final:
+            await reply(update, final)
 
     async def remove(update: Update, context: ContextTypes.DEFAULT_TYPE, delete_files: bool) -> None:
         if not await allowed(update, owner_only=True):
@@ -498,6 +546,7 @@ def build_application(config: Config, service: Service, access: Access, importer
     app.add_handler(CommandHandler("recent", recent))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("scan", scan))
+    app.add_handler(CommandHandler("refresh", refresh))
     app.add_handler(CommandHandler("add", add))
     app.add_handler(CommandHandler("sort", sort_cmd))
     app.add_handler(CommandHandler("import", import_cmd))
