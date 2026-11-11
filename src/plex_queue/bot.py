@@ -61,18 +61,19 @@ CHOOSE = InlineKeyboardMarkup(
 OWNER_HELP = """\
 /rm <id>  remove from Deluge and keep the files
 /rmdata <id>  remove from Deluge and delete the files
-/scan  reread local Plex DB and the drives
-/refresh  stop any Plex scan, fully rescan every section (with progress), then reread
+/scan  reread local Plex DB and the drives (no PMS full scan)
+/refresh  stop in-progress PMS scans, fully rescan every section (progress), then reread
 /upgrades  lower-quality copies ready to retire after a confirmed upgrade
 /drop <id>  move that old copy to the Recycle Bin (Windows)
 /keep <id>  leave the old copy and clear it from the list
-/tidy  audit library (duplicates, orphans, misplaced, layout)
+/tidy  audit library (duplicates, orphans, misplaced, release-junk renames)
 /tidy apply <id>  run one proposed fix
 /tidy apply dupes  trash strong (Plex-linked) duplicates
 /tidy apply renames 50   /tidy apply moves 1-20
 /tidy apply renames all  /tidy skip renames all
 /tidy orphans  ask Plex to scan orphan folders
 /tidy skip <id>  dismiss a proposal
+Renames only strip movie release-junk folders; sample before renames all.
 /import  run one import cycle now (copy finished downloads, scan Plex)
 /allow <id>  let someone request titles
 /deny <id>

@@ -6,6 +6,8 @@ It is intended for use across repositories and internal software programs. Repla
 
 **Engineering baseline for this repository:** implement and review code against §§9–11 (secrets, secure development, supply chain) at this corporate bar. `SECURITY_homelab.md` is an operator-facing disclosure variant only; it does not relax code controls.
 
+**This repository (plex-queue):** owner-gated Telegram/CLI control of Deluge, library tidy (move/rename/trash/scan), and full Plex Media Server refresh. Operator behavior and homelab disclosure live in `README.md` and `SECURITY_homelab.md`. Do not commit real `config.yaml` or tokens.
+
 ---
 
 ## 1. Principles

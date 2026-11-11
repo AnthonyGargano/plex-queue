@@ -145,15 +145,16 @@ Contributors must never commit real `config.yaml`, tokens, passwords, or private
 
 When changing this project, preserve or improve:
 
-1. **Owner vs guest authorization** on dangerous commands (`/rm`, `/allow`, `/tidy apply`, `/drop`, etc.).
+1. **Owner vs guest authorization** on dangerous commands (`/rm`, `/allow`, `/tidy apply`, `/drop`, `/refresh`, etc.).
 2. **Constant-time (or equivalent) comparison** for the claim secret; rate-limit `/claim`.
-3. **Path confinement** for import, tidy, and trash/drop flows (no writes outside configured roots; be careful with symlinks).
+3. **Path confinement** for import, tidy, and trash/drop flows (no writes outside configured roots; refuse symlinks on apply).
 4. **SSH host-key pinning** with strict checking against the dedicated known_hosts file (`deluge.ssh.allow_tofu` defaults to false; prefer `ssh-keyscan` on a trusted LAN).
 5. **Propose-and-confirm** for destructive library tidy actions unless the operator knowingly enables automation.
-6. Avoid logging tokens, passwords, or full secret values.
+6. Avoid logging tokens, passwords, Plex tokens, or full secret values (Plex token stays in the local registry / `X-Plex-Token` header only).
 7. Keep `setup_secret` long (16+), leave `allowed_user_ids` empty until after `/claim`, and use guest rate / active-download caps in config.
-8. `data/access.json` is HMAC-signed with `setup_secret`; tampered files are quarantined. Ownership is first-claim-wins (no secret reclaim)—set `telegram.owner_id` or delete a verified-bad `access.json` offline to reset.
+8. `data/access.json` (and other ledgers such as `tidy.json`) are HMAC-signed with `setup_secret`; tampered files are quarantined. Ownership is first-claim-wins (no secret reclaim)—set `telegram.owner_id` or delete a verified-bad `access.json` offline to reset.
 9. `search.endpoint` is HTTPS-only, DNS-checked against private ranges, and redirects are blocked at fetch time.
+10. **Full Plex refresh** (`/refresh`, CLI `refresh`) is owner-only: it may cancel in-progress scans and poll `/activities` on localhost PMS only.
 
 Suggested maintainer extras (not required for a tiny homelab, but valuable):
 

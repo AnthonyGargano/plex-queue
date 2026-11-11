@@ -62,9 +62,15 @@ import:
     - 'D:\Shows'
     - 'E:\Shows'
 
-# Library tidy (/tidy). Propose fixes; owner confirms before any move/trash.
+# Library tidy (/tidy or: python -m plex_queue tidy).
+# Propose-and-confirm only: owner must apply before any move/trash/rename/scan.
+# Renames clean release-junk movie folders; they do not rewrite episode titles.
+# Moves trust specialized shelves (kids/anime/doc/standup/…) and avoid yanking extras.
 # auto is reserved for a future unattended apply path and is not wired yet —
 # leave false; setting true only logs a warning.
+#
+# Full Plex rescan (owner): python -m plex_queue refresh   or Telegram /refresh
+# Local index only: /scan
 tidy:
   auto: false
   # Optional. When omitted, buckets are derived from library.roots + import folders.
@@ -76,3 +82,6 @@ tidy:
   #   anime_movies: ['L:\Anime\Movies']
   #   anime_shows: ['L:\Anime\Shows']
   #   documentary: ['H:\Documentary']
+  #   christmas: ['L:\Christmas Movies']
+  #   standup: ['L:\Standup']
+  #   workouts: ['L:\Workouts']
