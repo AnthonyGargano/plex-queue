@@ -9,11 +9,24 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
+from plex_queue.boost import (
+    MANUAL_STUCK_MIN_AGE_SECONDS,
+    MAX_MAGNETS_PER_TITLE,
+    STUCK_MIN_AGE_SECONDS,
+    clear_boost_siblings,
+    group_torrents_by_title,
+    is_stuck,
+    pick_alternate_hit,
+    request_from_label_or_name,
+    title_group_key,
+    title_group_key_from_label,
+    title_key_is_precise,
+)
 from plex_queue.decide import AlreadyHave, Enqueue, NoUpgrade, NothingFound, UnknownQuality, decide
 from plex_queue.errors import public_error
 from plex_queue.imdb import Identity, fetch_collection, fetch_imdb
 from plex_queue.library import fill_heights
-from plex_queue.models import Torrent, bucket, torrent_line
+from plex_queue.models import Copy, Torrent, bucket, torrent_line
 from plex_queue.place import Label, cleaned_title, is_complete, under_roots
 from plex_queue.search import magnet_uri
 from plex_queue.titles import (
@@ -546,6 +559,248 @@ class Service:
             f"In progress: {totals['active']}\n"
             f"Queued: {totals['queued']}\n"
             f"Finished: {totals['done']}"
+        )
+
+    def boost_stuck(
+        self,
+        user_id: int | None = None,
+        *,
+        only_when_added: bool = False,
+        min_age_seconds: int | None = None,
+    ) -> str:
+        """Add one alternate magnet per stuck title group.
+
+        Same-title magnets are grouped (movie+year or show+season/episode). A
+        title only gets another magnet when every incomplete member is stuck,
+        and only up to ``MAX_MAGNETS_PER_TITLE``. Owner-only when ``user_id``
+        is provided; import-cycle auto-boost omits it.
+
+        Manual /boost (``user_id`` set) uses no age wait — 0% and idle is
+        enough. Auto-boost keeps the multi-hour gate unless overridden.
+        """
+        if (
+            user_id is not None
+            and self.access is not None
+            and not self.access.is_owner(user_id)
+        ):
+            return "Only the owner can do that."
+        if min_age_seconds is None:
+            min_age_seconds = (
+                STUCK_MIN_AGE_SECONDS
+                if only_when_added or user_id is None
+                else MANUAL_STUCK_MIN_AGE_SECONDS
+            )
+        # CLI passes owner user_id; treat that like manual (no age wait).
+        if user_id is not None and not only_when_added:
+            min_age_seconds = MANUAL_STUCK_MIN_AGE_SECONDS
+        with self._lock:
+            torrents = self.deluge.list_torrents()
+        if self.ledger is None:
+            return self._noted("Import ledger is not set up.")
+        grouped = group_torrents_by_title(self.ledger, torrents)
+        candidates = []
+        for key, members in grouped.items():
+            if not title_key_is_precise(key):
+                continue
+            incomplete = [
+                item for item in members
+                if not is_complete(item.state, item.progress)
+            ]
+            if not incomplete:
+                continue
+            if not all(
+                is_stuck(item, min_age_seconds=min_age_seconds)
+                for item in incomplete
+            ):
+                continue
+            candidates.append((key, incomplete))
+        if not candidates:
+            if only_when_added:
+                return ""
+            if min_age_seconds <= 0:
+                return self._noted(
+                    "No stuck title groups (need incomplete magnets at 0% "
+                    "with no download for that title)."
+                )
+            hours = max(1, int(min_age_seconds) // 3600)
+            return self._noted(
+                "No stuck title groups (every incomplete magnet for a title "
+                f"must be at 0% for {hours}+ hours with no download)."
+            )
+        known = {item.hash.lower() for item in torrents}
+        added: list[str] = []
+        skipped: list[str] = []
+        for _key, members in sorted(candidates, key=lambda row: row[0]):
+            line = self._boost_title_group(
+                members, known, min_age_seconds=min_age_seconds,
+            )
+            if line.startswith("Added"):
+                added.append(line)
+            else:
+                skipped.append(line)
+        if only_when_added and not added:
+            return ""
+        bits = []
+        if added:
+            bits.append(f"Boosted {len(added)}:")
+            bits.extend(added)
+        if skipped and not only_when_added:
+            bits.append(f"Skipped {len(skipped)}:")
+            bits.extend(skipped)
+        if not bits:
+            return self._noted("Nothing to boost.")
+        return self._noted("\n".join(bits))
+
+    def clear_boost_siblings(self, finished_hash: str) -> list[str]:
+        """Remove incomplete same-title / boost-group peers after import."""
+        if self.ledger is None:
+            return []
+        with self._lock:
+            return clear_boost_siblings(self.ledger, self.deluge, finished_hash)
+
+    def _boost_title_group(
+        self,
+        members: list[Torrent],
+        known_hashes: set[str],
+        *,
+        min_age_seconds: int = STUCK_MIN_AGE_SECONDS,
+    ) -> str:
+        primary = min(members, key=lambda item: (item.time_added or 0, item.hash))
+        short = primary.short_id
+        name = _pretty_name(primary.name)
+        if self.ledger is None:
+            return f"{short}  {name}: import ledger is not set up"
+        label = self.ledger.label(primary.hash)
+        for item in members:
+            if label is None:
+                label = self.ledger.label(item.hash)
+        parsed, display = request_from_label_or_name(label, primary.name)
+        if not parsed.tokens:
+            return f"{short}  {name}: could not parse a title to search"
+        try:
+            hits = self._search_hits(parsed, display)
+        except Exception as exc:
+            return f"{short}  {name}: search failed ({public_error(exc)})"
+        group_key = title_group_key(
+            kind=parsed.kind,
+            title=display,
+            year=parsed.year,
+            season=parsed.season,
+            episode=parsed.episode,
+        )
+        # Cap + all-stuck re-check + add must be atomic across /boost and auto-boost.
+        with self._lock:
+            live_rows = {
+                item.hash.lower(): item for item in self.deluge.list_torrents()
+            }
+            known_hashes |= set(live_rows)
+            live_group = []
+            for item in live_rows.values():
+                if is_complete(item.state, item.progress):
+                    continue
+                item_key = None
+                state = self.ledger.state(item.hash) or {}
+                item_key = str(state.get("title_key") or "").strip() or None
+                if not item_key:
+                    item_key = title_group_key_from_label(self.ledger.label(item.hash))
+                if not item_key:
+                    item_parsed, item_display = request_from_label_or_name(
+                        None, item.name,
+                    )
+                    item_key = title_group_key(
+                        kind=item_parsed.kind,
+                        title=item_display,
+                        year=item_parsed.year,
+                        season=item_parsed.season,
+                        episode=item_parsed.episode,
+                    )
+                if group_key and item_key == group_key:
+                    live_group.append(item)
+            if not live_group:
+                return f"{short}  {name}: no longer in Deluge"
+            if not all(
+                is_stuck(item, min_age_seconds=min_age_seconds)
+                for item in live_group
+            ):
+                return f"{short}  {name}: a copy for this title is progressing"
+            # Count Deluge + ledger-linked peers so a magnet not yet visible in
+            # list_torrents still counts toward the per-title cap.
+            ledger_active = {
+                digest
+                for digest, row in self.ledger.states().items()
+                if str(row.get("title_key") or "") == (group_key or "")
+                and (
+                    digest in live_rows
+                    or (
+                        row.get("boost_group")
+                        and row.get("status") not in {"imported", "copied"}
+                        and not row.get("boost_cleared")
+                    )
+                )
+            }
+            effective = {item.hash.lower() for item in live_group} | ledger_active
+            if len(effective) >= MAX_MAGNETS_PER_TITLE:
+                return (
+                    f"{short}  {name}: already at {MAX_MAGNETS_PER_TITLE} "
+                    "magnets for this title"
+                )
+            alternate = pick_alternate_hit(
+                hits, min_height=self.min_height, exclude_hashes=known_hashes,
+            )
+            if alternate is None:
+                return (
+                    f"{short}  {name}: no other "
+                    f"{self.min_height}p+ release found"
+                )
+            state = self.ledger.state(primary.hash) or {}
+            for item in live_group:
+                row = self.ledger.state(item.hash) or {}
+                if row.get("replace_path"):
+                    state = row
+                    primary = item
+                    break
+            replacing = None
+            replace_path = state.get("replace_path")
+            replace_height = state.get("replace_height")
+            if replace_path:
+                replacing = Copy(
+                    "movie" if parsed.kind == "movie" else "episode",
+                    display,
+                    parsed.year,
+                    display if parsed.kind == "show" else None,
+                    parsed.season,
+                    parsed.episode,
+                    replace_height if isinstance(replace_height, int) else None,
+                    str(replace_path),
+                )
+            self.deluge.add_magnet(magnet_uri(alternate))
+            self._remember(
+                alternate.info_hash,
+                parsed,
+                display,
+                replacing,
+                episode=parsed.episode,
+            )
+            peer_hashes = [item.hash for item in live_group]
+            peer_hashes.append(alternate.info_hash)
+            # Prefer an original (no boost_of) as primary when linking.
+            link_primary = primary.hash
+            for item in live_group:
+                row = self.ledger.state(item.hash) or {}
+                if not row.get("boost_of"):
+                    link_primary = item.hash
+                    break
+            others = [digest for digest in peer_hashes if digest.lower() != link_primary.lower()]
+            self.ledger.link_boost_members(link_primary, others)
+            if group_key:
+                for digest in peer_hashes:
+                    self.ledger.mark(digest, title_key=group_key)
+            known_hashes.add(alternate.info_hash.lower())
+        shown = display or name
+        return (
+            f"Added {alternate.info_hash[:6]} for {shown} "
+            f"({len(live_group)} stuck, {alternate.seeders} seeders) — "
+            f"{_pretty_name(alternate.name)}"
         )
 
     def recent(self, window: str = "day", *, reveal_paths: bool = False) -> str:

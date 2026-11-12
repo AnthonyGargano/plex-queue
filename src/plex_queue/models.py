@@ -43,6 +43,7 @@ class Torrent:
     progress: float
     eta: int
     rate: int
+    time_added: int = 0
 
     @property
     def short_id(self) -> str:

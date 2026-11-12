@@ -37,7 +37,15 @@ class Deluge:
         status = self._call(
             "core.get_torrents_status",
             {},
-            ["name", "state", "progress", "eta", "download_payload_rate", "hash"],
+            [
+                "name",
+                "state",
+                "progress",
+                "eta",
+                "download_payload_rate",
+                "hash",
+                "time_added",
+            ],
         )
         torrents = []
         for info_hash, fields in status.items():
@@ -52,6 +60,9 @@ class Deluge:
                         fields.get("download_payload_rate")
                         or fields.get(b"download_payload_rate")
                         or 0
+                    ),
+                    time_added=int(
+                        fields.get("time_added") or fields.get(b"time_added") or 0
                     ),
                 )
             )

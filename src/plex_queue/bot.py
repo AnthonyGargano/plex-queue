@@ -75,6 +75,7 @@ OWNER_HELP = """\
 /tidy skip <id>  dismiss a proposal
 Renames only strip movie release-junk folders; sample before renames all.
 /import  run one import cycle now (copy finished downloads, scan Plex)
+/boost  add an alternate magnet for titles stuck at 0% with no download
 /allow <id>  let someone request titles
 /deny <id>
 /users  who is allowed
@@ -408,6 +409,13 @@ def build_application(config: Config, service: Service, access: Access, importer
         kind, needle = parsed
         await _sort(update, kind, needle)
 
+    async def boost_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await allowed(update, owner_only=True):
+            return
+        uid = user_id(update) or 0
+        await _starting(update)
+        await reply(update, await _work(lambda: service.boost_stuck(uid)))
+
     async def import_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await allowed(update, owner_only=True):
             return
@@ -551,6 +559,7 @@ def build_application(config: Config, service: Service, access: Access, importer
     app.add_handler(CommandHandler("add", add))
     app.add_handler(CommandHandler("sort", sort_cmd))
     app.add_handler(CommandHandler("import", import_cmd))
+    app.add_handler(CommandHandler("boost", boost_cmd))
     app.add_handler(CommandHandler("rm", rm))
     app.add_handler(CommandHandler("rmdata", rmdata))
     app.add_handler(CommandHandler("upgrades", upgrades))

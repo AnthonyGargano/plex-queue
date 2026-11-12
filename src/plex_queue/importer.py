@@ -23,6 +23,7 @@ from plex_queue.place import (
     under_roots,
 )
 from plex_queue.titles import parse_request
+from plex_queue.boost import clear_boost_siblings
 from plex_queue.upgrades import (
     path_key,
     plex_new_height,
@@ -55,6 +56,7 @@ class Importer:
         plex_db=None,
         min_height: int = 1080,
         library_roots=None,
+        booster=None,
     ):
         self.deluge = deluge
         self.ledger = ledger
@@ -72,6 +74,8 @@ class Importer:
         self.plex_db = Path(plex_db) if plex_db else None
         self.min_height = min_height
         self.library_roots = tuple(Path(root) for root in (library_roots or ()))
+        # Optional callable() -> str for stuck-torrent auto-boost at cycle end.
+        self.booster = booster
         if download_roots is None:
             self.download_roots = ("/home/ttt/Downloads",)
         else:
@@ -136,6 +140,9 @@ class Importer:
                 scan_dirs.append(Path(dest))
             if status == "copied" and dest:
                 if info_hash in hashes:
+                    sibling_notes = clear_boost_siblings(
+                        self.ledger, self.deluge, info_hash,
+                    )
                     try:
                         self.deluge.remove_hash(info_hash)
                     except Exception as exc:
@@ -147,11 +154,16 @@ class Importer:
                         )
                         if note:
                             notes.append(note)
+                        notes.extend(sibling_notes)
                         continue
                     self.ledger.mark(info_hash, status="imported", dest=dest)
                     notes.append(f"Removed the VM copy. Files are in {dest}.")
+                    notes.extend(sibling_notes)
                 else:
                     # Torrent vanished from Deluge without a successful remove this cycle.
+                    sibling_notes = clear_boost_siblings(
+                        self.ledger, self.deluge, info_hash,
+                    )
                     self.ledger.mark(info_hash, status="imported", dest=dest)
                     note = self._once(
                         info_hash,
@@ -162,6 +174,7 @@ class Importer:
                     )
                     if note:
                         notes.append(note)
+                    notes.extend(sibling_notes)
         for download in finished:
             note, folders = self._one(download)
             if note:
@@ -189,6 +202,23 @@ class Importer:
                 # Fold new files into the index; avoid a full multi-drive walk.
                 self.library.note_files(scan_dirs)
         notes.extend(self._promote_upgrades())
+        # Retry sibling cleanup only while a boost_group remains (failed remove).
+        for info_hash, state in self.ledger.states().items():
+            if state.get("status") not in {"imported", "copied"}:
+                continue
+            if not state.get("boost_group"):
+                continue
+            notes.extend(
+                clear_boost_siblings(self.ledger, self.deluge, info_hash)
+            )
+        if self.booster is not None:
+            try:
+                boost_note = self.booster()
+            except Exception as exc:
+                log.exception("auto-boost failed")
+                boost_note = f"Auto-boost failed: {public_error(exc)}"
+            if boost_note:
+                notes.append(boost_note)
         if not notes:
             pending = sum(
                 1 for state in self.ledger.states().values()
@@ -272,6 +302,7 @@ class Importer:
         self.ledger.mark(
             download.hash, status="copied", dest=dest, scanned=False, **upgrade_fields,
         )
+        sibling_notes = clear_boost_siblings(self.ledger, self.deluge, download.hash)
         try:
             self.deluge.remove_hash(download.hash)
         except Exception as exc:
@@ -280,6 +311,8 @@ class Importer:
             )
             if upgrade_note:
                 text = f"{text}\n{upgrade_note}"
+            if sibling_notes:
+                text = f"{text}\n" + "\n".join(sibling_notes)
             return self._once(
                 download.hash,
                 "copied",
@@ -294,6 +327,8 @@ class Importer:
         moved = f"Moved {label.title} to {dest}.\nRemoved the copy on the VM."
         if upgrade_note:
             moved = f"{moved}\n{upgrade_note}"
+        if sibling_notes:
+            moved = f"{moved}\n" + "\n".join(sibling_notes)
         return moved, [Path(dest)]
 
     def _place(self, job, root: Path) -> None:

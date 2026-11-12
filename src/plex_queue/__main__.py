@@ -34,7 +34,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("run", "check", "tidy", "refresh"),
+        choices=("run", "check", "tidy", "refresh", "boost"),
         default="run",
     )
     parser.add_argument("tidy_args", nargs="*", help="tidy subcommand args")
@@ -50,6 +50,9 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args.command == "refresh":
         refresh_cli(config)
+        return
+    if args.command == "boost":
+        boost_cli(config)
         return
     if not config.ready:
         raise SystemExit("Put the Telegram bot token in config.yaml first.")
@@ -105,6 +108,7 @@ def main(argv: list[str] | None = None) -> None:
         plex_db=config.plex_db,
         min_height=config.min_height,
         library_roots=config.roots,
+        booster=lambda: service.boost_stuck(only_when_added=True),
     )
     app = build_application(config, service, access, importer)
     stop = threading.Event()
@@ -190,6 +194,38 @@ def refresh_cli(config) -> None:
     """Ask Plex Media Server to fully refresh every library section."""
     service, owner = _owner_service(config)
     print(service.refresh_plex(owner, progress=print))
+
+
+def boost_cli(config) -> None:
+    """Scan Deluge for stuck torrents and queue one alternate each."""
+    _boot(config)
+    _pin_host(config)
+    if not config.setup_secret_ready:
+        raise SystemExit(
+            "Choose a private telegram.setup_secret (16+ characters) in config.yaml first."
+        )
+    library = Library(config.plex_db, list(config.roots))
+    access = Access(config)
+    owner = access.owner_id or config.owner_id
+    if not owner:
+        raise SystemExit("Set telegram.owner_id (or /claim) before using boost.")
+    ledger = Ledger(config.data_dir / "imports.json", secret=config.setup_secret)
+    deluge = Deluge(config)
+    try:
+        service = Service(
+            library,
+            _Search(config.search_endpoint),
+            deluge,
+            config.min_height,
+            access,
+            ledger,
+            roots=config.roots,
+            trash_dir=config.trash_dir,
+            plex_db=config.plex_db,
+        )
+        print(service.boost_stuck(owner))
+    finally:
+        deluge.close()
 
 
 def check(config) -> None:
