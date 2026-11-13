@@ -115,6 +115,10 @@ class Deluge:
         kept = "Deleted the files." if delete_files else "Left the files on disk."
         return f"Removed {chosen.name}. {kept}"
 
+    def ensure_tunnel(self) -> None:
+        """Ensure SSH local forwards (Deluge + optional Torznab) are up."""
+        self._ensure_tunnel()
+
     def _connect(self) -> None:
         self._ensure_tunnel()
         client = DelugeRPCClient(
@@ -141,11 +145,19 @@ class Deluge:
                 assert self._client is not None
                 return self._client.call(method, *args)
 
+    def _forwards_ready(self) -> bool:
+        if not _port_open(self.config.ssh_local_port):
+            return False
+        torznab = self.config.torznab
+        if torznab is not None and not _port_open(torznab.local_port):
+            return False
+        return True
+
     def _ensure_tunnel(self) -> None:
         status = ensure_running(self.config.vm_name, self.config.ssh_host)
         if status == "started":
             self.boot_note = f"Started {self.config.vm_name}."
-        if self._process and self._process.poll() is None and _port_open(self.config.ssh_local_port):
+        if self._process and self._process.poll() is None and self._forwards_ready():
             return
         if self._process and self._process.poll() is None:
             self._process.terminate()
@@ -166,12 +178,22 @@ class Deluge:
             "-o", "ServerAliveCountMax=3",
             "-L",
             f"127.0.0.1:{self.config.ssh_local_port}:127.0.0.1:{self.config.ssh_remote_port}",
-            f"{self.config.ssh_user}@{self.config.ssh_host}",
         ]
+        torznab = self.config.torznab
+        if torznab is not None:
+            command.extend(
+                [
+                    "-L",
+                    f"127.0.0.1:{torznab.local_port}:127.0.0.1:{torznab.remote_port}",
+                ]
+            )
+        command.append(f"{self.config.ssh_user}@{self.config.ssh_host}")
         log.info("opening SSH tunnel to %s", self.config.ssh_host)
         # DEVNULL for stderr: a PIPE without a reader can fill and hang ssh -N.
         # Failed starts still show up via poll() + missing local port.
-        self._process = subprocess.Popen(
+        from plex_queue.winproc import popen
+
+        self._process = popen(
             command,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -182,7 +204,7 @@ class Deluge:
                 raise DelugeError(
                     "SSH to the VM failed. Install the plex-queue key for ttt, then try again."
                 )
-            if _port_open(self.config.ssh_local_port):
+            if self._forwards_ready():
                 return
             time.sleep(0.2)
         if self._process.poll() is None:

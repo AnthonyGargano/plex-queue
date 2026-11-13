@@ -322,12 +322,15 @@ def probe_height(path: str) -> int | None:
     if not ffprobe:
         return None
     try:
+        from plex_queue.winproc import no_window_kwargs
+
         result = subprocess.run(
             [
                 ffprobe, "-v", "error", "-select_streams", "v:0",
                 "-show_entries", "stream=width,height", "-of", "csv=p=0", path,
             ],
             capture_output=True, text=True, timeout=20, check=False,
+            **no_window_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired):
         return None

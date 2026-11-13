@@ -48,6 +48,17 @@ library:
 search:
   # Must be https and not a private/loopback IP (config-tamper SSRF guard).
   endpoint: "https://apibay.org/q.php"
+  # Optional Torznab aggregator (Jackett or Prowlarr) on the Deluge VM.
+  # Bot reaches it only via SSH -L to 127.0.0.1 (same tunnel as Deluge).
+  # Install Jackett/Prowlarr on the VM (bind localhost), add indexers, then:
+  #   remote_port = VM listen port (9117 Jackett / 9696 Prowlarr)
+  #   local_port  = free port on Windows; url host must be 127.0.0.1:{local_port}
+  # Omit this block to use ApiBay only.
+  # torznab:
+  #   url: "http://127.0.0.1:19696/api/v2.0/indexers/all/results/torznab/api"
+  #   api_key: "PUT_TORZNAB_API_KEY_HERE"
+  #   local_port: 19696
+  #   remote_port: 9117
 
 import:
   every_minutes: 10
@@ -71,6 +82,13 @@ import:
 #
 # Full Plex rescan (owner): python -m plex_queue refresh   or Telegram /refresh
 # Local index only: /scan
+# Optional OpenTelemetry export to the local observability stack
+# (see observability/README.md). Loopback endpoint only.
+otel:
+  enabled: false
+  endpoint: "http://127.0.0.1:4317"
+  service_name: "plex-queue"
+
 tidy:
   auto: false
   # Optional. When omitted, buckets are derived from library.roots + import folders.

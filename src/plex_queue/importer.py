@@ -111,17 +111,19 @@ class Importer:
 
     def _cycle(self) -> list[str]:
         from plex_queue.events import emit
+        from plex_queue.otel_setup import span
 
-        try:
-            return self._cycle_body()
-        except Exception as exc:
-            # Keep partial progress (ledger flush still runs); surface a useful note
-            # so /import does not only say "Something went wrong."
-            log.exception("import cycle failed")
-            emit("import.cycle", status="fail", error=public_error(exc))
-            return [f"Import cycle stopped early: {public_error(exc)}"]
-        finally:
-            self.ledger.flush()
+        with span("import.cycle"):
+            try:
+                return self._cycle_body()
+            except Exception as exc:
+                # Keep partial progress (ledger flush still runs); surface a useful note
+                # so /import does not only say "Something went wrong."
+                log.exception("import cycle failed")
+                emit("import.cycle", status="fail", error=public_error(exc))
+                return [f"Import cycle stopped early: {public_error(exc)}"]
+            finally:
+                self.ledger.flush()
 
     def _cycle_body(self) -> list[str]:
         if not self.reachable():
@@ -219,27 +221,7 @@ class Importer:
                 boost_note = f"Auto-boost failed: {public_error(exc)}"
             if boost_note:
                 notes.append(boost_note)
-        if not notes:
-            pending = sum(
-                1 for state in self.ledger.states().values()
-                if state.get("upgrade_status") == "pending"
-            )
-            waiting = sum(
-                1 for state in self.ledger.states().values()
-                if state.get("upgrade_status") in {
-                    "awaiting_import", "awaiting_plex", "needs_video",
-                }
-            )
-            if pending:
-                notes.append(
-                    f"Nothing new to transfer. {pending} upgrade(s) ready for "
-                    "/upgrades → /drop (or /keep)."
-                )
-            elif waiting:
-                notes.append(
-                    f"Nothing new to transfer. {waiting} upgrade(s) still waiting "
-                    "on Plex confirmation — /upgrades."
-                )
+        # Idle upgrade backlog is for /upgrades — do not ping every timer tick.
         log.info("import cycle finished (%s note(s))", len(notes))
         from plex_queue.events import emit
 

@@ -38,6 +38,8 @@ def _windows_restrict(path: Path) -> None:
     # (OI)(CI) for directories so new children inherit the tightened ACL.
     rights = "(OI)(CI)(F)" if path.is_dir() else "(F)"
     try:
+        from plex_queue.winproc import no_window_kwargs
+
         completed = subprocess.run(
             [
                 "icacls",
@@ -49,6 +51,7 @@ def _windows_restrict(path: Path) -> None:
             capture_output=True,
             text=True,
             check=False,
+            **no_window_kwargs(),
         )
     except OSError as exc:
         log.warning("icacls failed for %s: %s", path, exc)

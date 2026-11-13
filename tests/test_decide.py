@@ -400,24 +400,43 @@ def test_release_filename_matches_clean_title_query():
     assert "Bourne" in found[0].title
 
 
-def test_a_bare_show_asks_for_a_season_instead_of_already_have():
+def test_picking_tv_show_without_a_season_fills_all_seasons():
     library = Library(None, [])
     library.loaded = True
     library.copies = [
         episode("Example Show", 1, 1, 1080),
-        episode("Example Show", 1, 2, 480),
+        episode("Example Show", 1, 2, 1080),
         episode("Example Show", 2, 1, 1080),
     ]
+    queries = []
 
     class Search:
         def search(self, query, match_as=None):
-            raise AssertionError(query)
+            queries.append(match_as or query)
+            return []
 
     text = Service(library, Search(), _Deluge()).request("Example Show", kind="show")
-    assert 'Found "Example Show" on Plex with 2 season(s)' in text
-    assert "needs a season or episode" in text
-    assert "S01" in text
-    assert "S02" in text
+    assert 'Found' in text and 'season' in text.lower()
+    assert "Already on Plex" in text
+    assert any("S01" in q or "S02" in q for q in queries) or "S01" in text
+
+
+def test_picking_tv_show_for_all_of_me_stays_a_single_title():
+    library = Library(None, [])
+    library.loaded = True
+    library.copies = []
+    queries = []
+
+    class Search:
+        def search(self, query, match_as=None):
+            queries.append(match_as or query)
+            return []
+
+    text = Service(library, Search(), _Deluge()).request("all of me", kind="show")
+    assert text == "Nothing matched that title."
+    assert queries
+    assert not any("S0" in q for q in queries)
+    assert "season" not in text.lower()
 
 
 def test_a_season_with_a_low_episode_queues_a_pack():

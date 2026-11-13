@@ -25,6 +25,7 @@ Typical deployment assumptions for this class of project:
 - Trust boundary is roughly: **Telegram bot token + owner allow-list + SSH access to a download VM + local media paths**.
 - Guests may request titles only after the owner explicitly `/allow`s them.
 - Secrets live in **local** `config.yaml` / SSH keys / OS stores — not in git.
+- Optional local observability (`observability/` Docker Compose: Grafana, Kafka, OTEL Collector, Prometheus, Loki, Tempo) publishes only on **loopback** (Grafana on `127.0.0.1:3001`). Default Grafana `admin`/`admin` is lab-only — change it. Do not expose those ports on the LAN. Telemetry endpoints in `config.yaml` are restricted to loopback; do not put tokens/passwords in OTEL event fields.
 
 If you fork this for a shared or internet-exposed deployment, tighten auth, networking, and monitoring beyond what this doc assumes.
 
@@ -153,7 +154,7 @@ When changing this project, preserve or improve:
 6. Avoid logging tokens, passwords, Plex tokens, or full secret values (Plex token stays in the local registry / `X-Plex-Token` header only).
 7. Keep `setup_secret` long (16+), leave `allowed_user_ids` empty until after `/claim`, and use guest rate / active-download caps in config.
 8. `data/access.json` (and other ledgers such as `tidy.json`) are HMAC-signed with `setup_secret`; tampered files are quarantined. Ownership is first-claim-wins (no secret reclaim)—set `telegram.owner_id` or delete a verified-bad `access.json` offline to reset.
-9. `search.endpoint` is HTTPS-only, DNS-checked against private ranges, and redirects are blocked at fetch time.
+9. `search.endpoint` is HTTPS-only, DNS-checked against private ranges, and redirects are blocked at fetch time. Optional `search.torznab` is **http://127.0.0.1 only** (SSH local forward to Jackett/Prowlarr on the Deluge VM); the API key stays in `config.yaml` and must not be logged.
 10. **Full Plex refresh** (`/refresh`, CLI `refresh`) is owner-only: it may cancel in-progress scans and poll `/activities` on localhost PMS only.
 
 Suggested maintainer extras (not required for a tiny homelab, but valuable):

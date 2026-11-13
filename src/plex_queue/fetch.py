@@ -91,7 +91,11 @@ class SshFetch:
         self.host = host
         self.known_hosts = known_hosts
         self.ssh = ssh or shutil.which("ssh") or r"C:\Windows\System32\OpenSSH\ssh.exe"
-        self.run = run or subprocess.run
+        if run is None:
+            from plex_queue.winproc import run as hidden_run
+
+            run = hidden_run
+        self.run = run
         self.download_roots = _roots_or_fail(download_roots)
 
     def fetch(self, remote: str, local: Path, size: int) -> None:

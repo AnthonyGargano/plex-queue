@@ -36,8 +36,24 @@ SET_SHOW_KIND = re.compile(
     r"^(?:all|every)\s+(?:the\s+)?(.+?)\s+(?:tv\s+shows?|tv\s+series|series)$",
     re.IGNORECASE,
 )
+# "all/every/each season(s)|episode(s) of X"
 ALL_SEASONS = re.compile(
-    r"^(?:all|every)\s+seasons?\s+(?:of\s+(?:the\s+)?)?(.+)$",
+    r"^(?:all|every|each)\s+(?:seasons?|episodes?)\s+(?:of\s+(?:the\s+)?)?(.+)$",
+    re.IGNORECASE,
+)
+# "mr ed all tv shows" / "clerks all movies" (all|every|each before kind words).
+TRAILING_ALL_KIND = re.compile(
+    r"\s+(?:all|every|each)\s+"
+    r"(?P<kind>tv\s+shows?|tv\s+series|series|shows?|movies?|films?)"
+    r"(?=\s*$|\s+(?:s\d{1,2}\b|season\b|e\d{1,2}\b|\d{1,2}x\d{1,2}\b))",
+    re.IGNORECASE,
+)
+# Trailing pack cue: "… all", "… all seasons/episodes", "… every", also before S01.
+# Require EOS or a season marker after the cue so "watch all of …" is not stripped.
+TRAILING_ALL_SEASONS = re.compile(
+    r"\s+(?:all|every|each)"
+    r"(?:\s+(?:seasons?|episodes?|eps?|espisodes?))?"
+    r"(?=\s*$|\s+(?:s\d{1,2}\b|season\b|e\d{1,2}\b|\d{1,2}x\d{1,2}\b))",
     re.IGNORECASE,
 )
 TRAILING_SET_MOVIE = re.compile(
@@ -64,6 +80,12 @@ LEADING_KIND = re.compile(
 TRAILING_MOVIE = re.compile(r"[\s:,\-]*(movie|film)\s*$", re.IGNORECASE)
 TRAILING_SHOW = re.compile(
     r"[\s:,\-]*(tv\s+shows?|tv\s+series|series)\s*$",
+    re.IGNORECASE,
+)
+# After stripping "all seasons", "tv show" may sit before S01 rather than at EOS.
+KIND_BEFORE_SEASON = re.compile(
+    r"[\s:,\-]*(?:tv\s+shows?|tv\s+series|series|movie|film)\b"
+    r"(?=\s+(?:s\d{1,2}\b|season\b|e\d{1,2}\b|\d{1,2}x\d{1,2}\b))",
     re.IGNORECASE,
 )
 KIND_ONLY = re.compile(
@@ -121,6 +143,9 @@ def video_height(name: str) -> int | None:
 
 def tokenize(text: str) -> list[str]:
     text = text.lower().replace("&", " and ")
+    # Possessives: "rocko's" / "rocco's" → rocko / rocco (not a stray "s" token).
+    text = re.sub(r"['\u2019]s\b", "", text)
+    text = text.replace("'", "").replace("\u2019", "")
     text = SEASON_EP.sub(" ", text)
     text = X_EP.sub(" ", text)
     text = SEASON_ONLY.sub(" ", text)
@@ -155,6 +180,21 @@ def parse_request(text: str) -> Request:
         work = IMDB_ID.sub(" ", work)
     else:
         work = raw
+    # Strip trailing pack cues before set/kind handling:
+    # "Title all tv shows", "Title tv show all", "… all episodes".
+    had_trailing_all_seasons = False
+    trailing_pack_kind = None
+    kind_pack = TRAILING_ALL_KIND.search(work)
+    if kind_pack:
+        had_trailing_all_seasons = True
+        label = kind_pack.group("kind").lower()
+        trailing_pack_kind = (
+            "movie" if ("movie" in label or "film" in label) else "show"
+        )
+        work = TRAILING_ALL_KIND.sub(" ", work)
+    if TRAILING_ALL_SEASONS.search(work):
+        had_trailing_all_seasons = True
+        work = TRAILING_ALL_SEASONS.sub(" ", work)
     explicit = _explicit_kind(work)
     # Resolve "all of the …" before stripping trailing kind words so
     # "all of the office tv show" keeps enough context to mark a show set.
@@ -170,6 +210,8 @@ def parse_request(text: str) -> Request:
         work = LEADING_KIND.sub(" ", work)
         work = TRAILING_MOVIE.sub(" ", work)
         work = TRAILING_SHOW.sub(" ", work)
+    # Kind words may sit before S01 rather than at end-of-string.
+    work = KIND_BEFORE_SEASON.sub(" ", work)
     season = episode = year = None
     match = SEASON_EP.search(work)
     if match:
@@ -198,12 +240,44 @@ def parse_request(text: str) -> Request:
     if match:
         year = int(match.group(0))
         work = YEAR.sub(" ", work)
+    # Trailing pack cue with no Sxx → collection fill.
+    # With Sxx → normal single-season request on the cleaned title.
+    if had_trailing_all_seasons and season is None and episode is None:
+        # After stripping "… all tv shows", leftover may be "watch all of X"
+        # or "all of me" — rescue a real set, and do not force a false one.
+        if subject is None:
+            candidate = work.strip()
+            embedded = re.search(
+                r"(?i)\b((?:all|every)\s+of\s+.+)$", candidate,
+            )
+            if embedded:
+                candidate = embedded.group(1).strip()
+            again_subject, again_kind = _set_subject(candidate)
+            if again_subject is not None:
+                work = again_subject
+                subject = again_subject
+                collection = True
+                if again_kind and (
+                    explicit is None or explicit == trailing_pack_kind
+                ):
+                    explicit = again_kind
+            elif embedded is not None:
+                # "all of me" / "watch all of me" + trailing pack → film title.
+                had_trailing_all_seasons = False
+                work = candidate
+                if trailing_pack_kind and explicit == trailing_pack_kind:
+                    explicit = _explicit_kind(work)
+        if had_trailing_all_seasons:
+            collection = True
+            # Bare "Title all" stays kind-unclear (movie vs show prompt).
+            # "Title all movies/tv shows" / "… tv show all" already set explicit.
+            if explicit is None and trailing_pack_kind:
+                explicit = trailing_pack_kind
     limited = COLLECTION_WORD.search(work)
     if limited:
         collection = True
         limit = SET_LIMIT.get(limited.group(1).lower())
         work = COLLECTION_WORD.sub(" ", work)
-    franchise = " ".join(work.split()) if collection else None
     # An episode number without a season is incomplete for matching and search.
     if episode is not None and season is None:
         episode = None
@@ -217,10 +291,40 @@ def parse_request(text: str) -> Request:
     else:
         # Bare "all of X" stays unclear so the bot can ask movie vs TV show.
         kind = None
+    # Known films win over show/collection cues (including "… all tv shows").
+    me = all_of_me_title(work)
+    if me and season is None and episode is None:
+        work = me
+        kind = "movie"
+        collection = False
+    else:
+        film = film_show_title(work)
+        if film and season is None and episode is None:
+            work = film
+            kind = "movie"
+            collection = False
+        elif kind == "show" and season is None and episode is None and not collection:
+            # "Title tv show" / "tv show Title" with no Sxx → fill every season.
+            collection = True
+    franchise = " ".join(work.split()) if collection else None
     return Request(
         raw, tuple(tokenize(work)), year, season, episode, kind, imdb_id,
         collection, franchise, limit,
     )
+
+
+def all_of_me_title(text: str) -> str | None:
+    """Return 'all of me' when text is that film title, optionally with a lead-in."""
+    normalized = " ".join(text.split())
+    match = re.search(r"(?i)\ball\s+of\s+me$", normalized)
+    return match.group(0) if match else None
+
+
+def film_show_title(text: str) -> str | None:
+    """Return a known *Show film title when present (optionally with a lead-in)."""
+    normalized = " ".join(text.split())
+    match = re.search(r"(?i)\b(?:the\s+)?truman\s+show$", normalized)
+    return match.group(0) if match else None
 
 
 def _set_subject(text: str) -> tuple[str | None, str | None]:
@@ -228,7 +332,11 @@ def _set_subject(text: str) -> tuple[str | None, str | None]:
     stripped = text.strip()
     match = ALL_SEASONS.match(stripped)
     if match:
-        return (_normalize_set_name(match.group(1)), "show")
+        subject = match.group(1).strip()
+        # Same as SET_OF: drop trailing "tv show" left in the capture.
+        subject = TRAILING_SET_SHOW.sub("", subject)
+        subject = TRAILING_SET_MOVIE.sub("", subject)
+        return (_normalize_set_name(subject), "show")
     # Prefer "all of …" before "all … tv show" so "all of ted lasso tv show"
     # does not capture a leading "of" as part of the title.
     match = SET_OF.match(stripped)

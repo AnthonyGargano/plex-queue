@@ -108,6 +108,8 @@ def ensure_running(
 
 
 def powershell(script: str, vm_name: str) -> str:
+    from plex_queue.winproc import no_window_kwargs
+
     env = os.environ.copy()
     env["PLEX_QUEUE_VM"] = vm_name
     completed = subprocess.run(
@@ -116,6 +118,7 @@ def powershell(script: str, vm_name: str) -> str:
         text=True,
         env=env,
         check=False,
+        **no_window_kwargs(),
     )
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout).strip()

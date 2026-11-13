@@ -12,6 +12,11 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+otel = [
+  "opentelemetry-api==1.29.0",
+  "opentelemetry-sdk==1.29.0",
+  "opentelemetry-exporter-otlp-proto-grpc==1.29.0",
+]
 
 [project.scripts]
 plex-queue = "plex_queue.__main__:main"

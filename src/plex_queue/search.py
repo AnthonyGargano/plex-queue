@@ -3,16 +3,20 @@ from __future__ import annotations
 import http.client
 import ipaddress
 import json
+import logging
 import socket
 import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 
 from plex_queue.cache import TtlCache
-from plex_queue.config import validate_search_endpoint
+from plex_queue.config import TorznabConfig, validate_search_endpoint
 from plex_queue.models import Hit
 from plex_queue.titles import franchise_match, parse_request, phrase_match, tokenize
+
+log = logging.getLogger(__name__)
 
 TRACKER = "udp://tracker.opentrackr.org:1337/announce"
 EMPTY_HASH = "0" * 40
@@ -51,6 +55,33 @@ def magnet_uri(hit: Hit) -> str:
     name = urllib.parse.quote(hit.name, safe="")
     tracker = urllib.parse.quote(TRACKER, safe="")
     return f"magnet:?xt=urn:btih:{hit.info_hash}&dn={name}&tr={tracker}"
+
+
+def search_hits(
+    query: str,
+    endpoint: str,
+    *,
+    torznab: TorznabConfig | None = None,
+    match_as: str | None = None,
+    ensure_tunnel: Callable[[], None] | None = None,
+    timeout: int = 30,
+) -> list[Hit]:
+    """Prefer Torznab (VM aggregator) when configured; fall back to ApiBay."""
+    if torznab is not None:
+        if ensure_tunnel is not None:
+            ensure_tunnel()
+        try:
+            from plex_queue.torznab import fetch_torznab_hits
+
+            hits = fetch_torznab_hits(
+                query, torznab, timeout=timeout, match_as=match_as,
+            )
+            if hits:
+                return hits
+        except Exception:
+            # Never log the Torznab URL query string (contains api_key).
+            log.warning("torznab search failed; falling back to search.endpoint")
+    return fetch_hits(query, endpoint, timeout=timeout, match_as=match_as)
 
 
 def fetch_hits(

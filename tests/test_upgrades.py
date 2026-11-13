@@ -178,6 +178,43 @@ def test_promote_upgrade_when_plex_confirms(tmp_path):
     assert any("Upgrade ready for review" in note for note in notes)
 
 
+def test_idle_cycle_stays_quiet_while_upgrades_are_pending(tmp_path):
+    movies = tmp_path / "Movies"
+    movies.mkdir()
+    digest = "ab" * 20
+    ledger = Ledger(tmp_path / "imports.json")
+    ledger.remember(digest, Label("movie", "Example", 2019))
+    ledger.mark(
+        digest,
+        status="imported",
+        dest=str(movies),
+        scanned=True,
+        upgrade_status="pending",
+        new_height=1080,
+    )
+    notes_sent = []
+    importer = Importer(
+        deluge=_EmptyDeluge(),
+        ledger=ledger,
+        movie_dirs=[movies],
+        show_dirs=[movies],
+        margin=0,
+        transport=None,
+        plex=_NoPlex(),
+        notify=notes_sent.append,
+        reachable=lambda: True,
+        plex_db=None,
+        min_height=1080,
+        library_roots=[movies],
+    )
+    first = importer.cycle(notify=True)
+    second = importer.cycle(notify=True)
+    assert first == []
+    assert second == []
+    assert notes_sent == []
+    assert ledger.state(digest)["upgrade_status"] == "pending"
+
+
 def test_drop_moves_old_file_to_trash(tmp_path, monkeypatch):
     movies = tmp_path / "Movies"
     trash = tmp_path / "trash"
@@ -401,4 +438,7 @@ def _config(tmp_path: Path, owner_id: int = 0) -> Config:
         tidy_buckets={},
         guest_hourly_limit=5,
         guest_max_active=3,
+        otel_enabled=False,
+        otel_endpoint="http://127.0.0.1:4317",
+        otel_service_name="plex-queue",
     )

@@ -32,6 +32,8 @@ from plex_queue.search import magnet_uri
 from plex_queue.titles import (
     MAX_SHOW_SEASONS,
     Request,
+    all_of_me_title,
+    film_show_title,
     franchise_match,
     parse_request,
     phrase_match,
@@ -145,11 +147,43 @@ class Service:
             display = identity.title or display
             parsed = _from_identity(query, identity)
         elif kind in {"movie", "show"}:
+            collection = parsed.collection
+            franchise = parsed.franchise
+            # Picking "TV show" without a season means fill the whole series —
+            # do not ask again for "all" / S01.
+            title = " ".join(
+                str(display or " ".join(parsed.tokens)).split()
+            )
+            if (
+                kind == "show"
+                and parsed.season is None
+                and parsed.episode is None
+                and not collection
+            ):
+                collection = True
+                franchise = franchise or title or None
             parsed = Request(
                 parsed.raw, parsed.tokens, parsed.year, parsed.season,
-                parsed.episode, kind, parsed.imdb_id, parsed.collection,
-                parsed.franchise, parsed.collection_limit,
+                parsed.episode, kind, parsed.imdb_id, collection,
+                franchise, parsed.collection_limit,
             )
+        # Known films never season-fill, even after kind / pack cues.
+        title = " ".join(str(display or " ".join(parsed.tokens)).split())
+        me = all_of_me_title(title)
+        if me and parsed.season is None and parsed.episode is None:
+            parsed = Request(
+                parsed.raw, tuple(tokenize(me)), parsed.year, parsed.season,
+                parsed.episode, "movie", parsed.imdb_id, False, None,
+                parsed.collection_limit,
+            )
+        else:
+            film = film_show_title(title)
+            if film and parsed.season is None and parsed.episode is None:
+                parsed = Request(
+                    parsed.raw, tuple(tokenize(film)), parsed.year,
+                    parsed.season, parsed.episode, "movie", parsed.imdb_id,
+                    False, None, parsed.collection_limit,
+                )
         if parsed.collection and not brief:
             if parsed.kind == "show":
                 return self._fill_show_seasons(parsed, as_guest=as_guest)
@@ -1051,39 +1085,42 @@ class Service:
             if progress is not None and message:
                 progress(message)
 
+        from plex_queue.otel_setup import span
+
         started = timed()
-        report("Stopping any in-progress scan and starting a full Plex refresh…")
-        notes, section_ids = self.plex.refresh_all()
-        kickoff = "\n".join(notes) if notes else "Refresh requested."
-        report(kickoff)
-        if section_ids:
-            report(
-                f"Watching Plex scan progress (about every {max(5, int(poll_seconds))}s; "
-                f"won't finish before {max(0, int(min_wait_seconds)) // 60}m)…"
+        with span("plex.refresh_all", user_id=user_id):
+            report("Stopping any in-progress scan and starting a full Plex refresh…")
+            notes, section_ids = self.plex.refresh_all()
+            kickoff = "\n".join(notes) if notes else "Refresh requested."
+            report(kickoff)
+            if section_ids:
+                report(
+                    f"Watching Plex scan progress (about every {max(5, int(poll_seconds))}s; "
+                    f"won't finish before {max(0, int(min_wait_seconds)) // 60}m)…"
+                )
+                self._wait_for_plex_scan(
+                    report,
+                    poll_seconds=poll_seconds,
+                    max_wait_seconds=max_wait_seconds,
+                    min_wait_seconds=min_wait_seconds,
+                    idle_polls=idle_polls,
+                    sleep=sleeper,
+                )
+            report("Rereading local Plex DB and drives…")
+            self.library.refresh()
+            notes.extend(self.library.notes)
+            emit(
+                "plex.refresh_all",
+                status="ok" if section_ids else "error",
+                user_id=user_id,
+                sections=len(section_ids),
+                duration_ms=duration_ms(started),
             )
-            self._wait_for_plex_scan(
-                report,
-                poll_seconds=poll_seconds,
-                max_wait_seconds=max_wait_seconds,
-                min_wait_seconds=min_wait_seconds,
-                idle_polls=idle_polls,
-                sleep=sleeper,
-            )
-        report("Rereading local Plex DB and drives…")
-        self.library.refresh()
-        notes.extend(self.library.notes)
-        emit(
-            "plex.refresh_all",
-            status="ok" if section_ids else "error",
-            user_id=user_id,
-            sections=len(section_ids),
-            duration_ms=duration_ms(started),
-        )
-        summary = ["Plex refresh request complete; local index reread."]
-        summary.extend(self.library.notes)
-        if not section_ids and notes:
-            return "\n".join(notes)
-        return "\n".join(summary)
+            summary = ["Plex refresh request complete; local index reread."]
+            summary.extend(self.library.notes)
+            if not section_ids and notes:
+                return "\n".join(notes)
+            return "\n".join(summary)
 
     def _wait_for_plex_scan(
         self,
@@ -1166,28 +1203,33 @@ class Service:
             return "Only the owner can do that."
         if self.tidy_ledger is None:
             return "Tidy review is not set up."
+        from plex_queue.otel_setup import span
+
         with self._lock:
             notes: list[str] = []
             if refresh:
                 started = timed()
-                self.library.refresh()
-                notes.extend(self.library.notes)
-                actions, space = self._audit_actions()
-                self.tidy_ledger.replace_pending([action.as_row() for action in actions])
-                notes.extend(space)
-                counts: dict[str, int] = {}
-                for action in actions:
-                    if action.status != "pending":
-                        continue
-                    counts[action.kind] = counts.get(action.kind, 0) + 1
-                emit(
-                    "tidy.audit",
-                    status="ok",
-                    user_id=user_id,
-                    pending=sum(counts.values()),
-                    counts=counts,
-                    duration_ms=duration_ms(started),
-                )
+                with span("tidy.audit", user_id=user_id):
+                    self.library.refresh()
+                    notes.extend(self.library.notes)
+                    actions, space = self._audit_actions()
+                    self.tidy_ledger.replace_pending(
+                        [action.as_row() for action in actions]
+                    )
+                    notes.extend(space)
+                    counts: dict[str, int] = {}
+                    for action in actions:
+                        if action.status != "pending":
+                            continue
+                        counts[action.kind] = counts.get(action.kind, 0) + 1
+                    emit(
+                        "tidy.audit",
+                        status="ok",
+                        user_id=user_id,
+                        pending=sum(counts.values()),
+                        counts=counts,
+                        duration_ms=duration_ms(started),
+                    )
             rows = self.tidy_ledger.list(statuses={"pending", "blocked"})
             return format_report(
                 rows,
@@ -1224,42 +1266,52 @@ class Service:
                     f"id {action_id} is report-only.\n"
                     f"{row.get('detail') or 'No automatic fix.'}"
                 )
+            from plex_queue.otel_setup import span
+
             started = timed()
-            try:
-                message = apply_action(
-                    row,
-                    roots=self.roots,
-                    trash_dir=self.trash_dir,
-                    plex=self.plex,
-                    library=self.library,
-                    free_of=lambda path: int(shutil.disk_usage(path).free),
-                    margin=self.import_margin,
-                    upgrade_paths=self._upgrade_paths(),
-                )
-            except (OSError, sqlite3.Error) as exc:
-                self.tidy_ledger.mark(action_id, status="failed", error=public_error(exc))
+            with span(
+                "tidy.apply",
+                action_id=action_id,
+                kind=str(row.get("kind") or ""),
+                user_id=user_id,
+            ):
+                try:
+                    message = apply_action(
+                        row,
+                        roots=self.roots,
+                        trash_dir=self.trash_dir,
+                        plex=self.plex,
+                        library=self.library,
+                        free_of=lambda path: int(shutil.disk_usage(path).free),
+                        margin=self.import_margin,
+                        upgrade_paths=self._upgrade_paths(),
+                    )
+                except (OSError, sqlite3.Error) as exc:
+                    self.tidy_ledger.mark(
+                        action_id, status="failed", error=public_error(exc),
+                    )
+                    emit(
+                        "tidy.apply",
+                        status="failed",
+                        action_id=action_id,
+                        kind=row.get("kind"),
+                        user_id=user_id,
+                        error=public_error(exc),
+                        duration_ms=duration_ms(started),
+                    )
+                    return f"Could not apply tidy {action_id}: {public_error(exc)}"
+                self.tidy_ledger.mark(action_id, status="done")
+                self.tidy_ledger.cancel_related(row.get("source"), except_id=action_id)
                 emit(
                     "tidy.apply",
-                    status="failed",
+                    status="ok",
                     action_id=action_id,
                     kind=row.get("kind"),
                     user_id=user_id,
-                    error=public_error(exc),
+                    confidence=row.get("confidence") or "plex",
                     duration_ms=duration_ms(started),
                 )
-                return f"Could not apply tidy {action_id}: {public_error(exc)}"
-            self.tidy_ledger.mark(action_id, status="done")
-            self.tidy_ledger.cancel_related(row.get("source"), except_id=action_id)
-            emit(
-                "tidy.apply",
-                status="ok",
-                action_id=action_id,
-                kind=row.get("kind"),
-                user_id=user_id,
-                confidence=row.get("confidence") or "plex",
-                duration_ms=duration_ms(started),
-            )
-            return f"Applied {action_id}.\n{message}"
+                return f"Applied {action_id}.\n{message}"
 
     def tidy_skip(self, needle: str, user_id: int = 0) -> str:
         if self.access is None or not self.access.is_owner(user_id):

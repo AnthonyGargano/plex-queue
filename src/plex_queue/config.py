@@ -14,6 +14,17 @@ from plex_queue.place import general_dirs
 # Placeholder values allowed at load time so setup can finish editing config.yaml.
 _SETUP_SECRET_PLACEHOLDERS = frozenset({"", "change-this-secret"})
 _MIN_SETUP_SECRET_LEN = 16
+_TORZNAB_KEY_PLACEHOLDERS = frozenset({"", "PUT_TORZNAB_API_KEY_HERE", "change-me"})
+
+
+@dataclass(frozen=True)
+class TorznabConfig:
+    """Jackett/Prowlarr Torznab via SSH local forward to the Deluge VM."""
+
+    url: str
+    api_key: str
+    local_port: int
+    remote_port: int
 
 
 @dataclass(frozen=True)
@@ -48,6 +59,10 @@ class Config:
     tidy_buckets: dict[str, tuple[Path, ...]]
     guest_hourly_limit: int
     guest_max_active: int
+    otel_enabled: bool
+    otel_endpoint: str
+    otel_service_name: str
+    torznab: TorznabConfig | None = None
 
     @property
     def ready(self) -> bool:
@@ -80,6 +95,7 @@ def load_config(path: Path | str | None = None) -> Config:
     vm = raw.get("vm") or {}
     incoming = raw.get("import") or {}
     tidy = raw.get("tidy") or {}
+    otel = raw.get("otel") or {}
     root = path.parent
     plex = library.get("plex_db")
     roots = tuple(_expand(item) for item in library.get("roots") or [])
@@ -134,6 +150,14 @@ def load_config(path: Path | str | None = None) -> Config:
         tidy_buckets=derive_buckets(roots, movie_dirs, show_dirs, explicit),
         guest_hourly_limit=max(1, int(telegram.get("guest_hourly_limit") or 5)),
         guest_max_active=max(0, int(telegram.get("guest_max_active") or 3)),
+        otel_enabled=bool(otel.get("enabled") or False),
+        otel_endpoint=str(otel.get("endpoint") or "http://127.0.0.1:4317").strip(),
+        otel_service_name=str(otel.get("service_name") or "plex-queue").strip()
+        or "plex-queue",
+        torznab=validate_torznab_config(
+            search.get("torznab"),
+            ssh_local_port=int(ssh.get("local_port") or 15884),
+        ),
     )
 
 
@@ -167,6 +191,66 @@ def validate_search_endpoint(endpoint: str, *, resolve: bool = True) -> str:
     elif resolve:
         _assert_public_dns(host)
     return text
+
+
+def validate_torznab_config(
+    raw, *, ssh_local_port: int | None = None,
+) -> TorznabConfig | None:
+    """Optional Torznab block: http loopback only, matched to SSH local_port."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise SystemExit("search.torznab must be a mapping with url, api_key, ports.")
+    url = str(raw.get("url") or "").strip()
+    api_key = str(raw.get("api_key") or "").strip()
+    try:
+        local_port = int(raw.get("local_port"))
+        remote_port = int(raw.get("remote_port"))
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(
+            "search.torznab.local_port and remote_port must be integers."
+        ) from exc
+    if not (1 <= local_port <= 65535) or not (1 <= remote_port <= 65535):
+        raise SystemExit("search.torznab ports must be between 1 and 65535.")
+    if ssh_local_port is not None and local_port == int(ssh_local_port):
+        raise SystemExit(
+            "search.torznab.local_port must differ from deluge.ssh.local_port "
+            "(both are SSH -L binds on 127.0.0.1)."
+        )
+    if api_key in _TORZNAB_KEY_PLACEHOLDERS:
+        raise SystemExit("search.torznab.api_key is missing (set the Jackett/Prowlarr key).")
+    if not url:
+        raise SystemExit("search.torznab.url is empty.")
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme.lower() != "http":
+        raise SystemExit(
+            "search.torznab.url must use http:// (SSH tunnel to 127.0.0.1 only)."
+        )
+    if parsed.username or parsed.password:
+        raise SystemExit("search.torznab.url must not include credentials.")
+    host = (parsed.hostname or "").strip().lower()
+    if host not in {"127.0.0.1", "localhost"}:
+        raise SystemExit(
+            "search.torznab.url host must be 127.0.0.1 or localhost "
+            "(reach the VM aggregator only via the SSH local forward)."
+        )
+    if parsed.port is None:
+        raise SystemExit(
+            "search.torznab.url must include an explicit port matching local_port."
+        )
+    if int(parsed.port) != local_port:
+        raise SystemExit(
+            "search.torznab.url port must equal search.torznab.local_port."
+        )
+    # Normalize host to IPv4 loopback so fetch never follows localhost DNS tricks.
+    path = parsed.path or "/"
+    safe = f"http://127.0.0.1:{local_port}{path}"
+    return TorznabConfig(
+        url=safe,
+        api_key=api_key,
+        local_port=local_port,
+        remote_port=remote_port,
+    )
 
 
 def _reject_special_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address, label: str) -> None:

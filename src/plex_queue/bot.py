@@ -23,7 +23,12 @@ from plex_queue.config import Config
 from plex_queue.deluge_remote import DelugeError
 from plex_queue.errors import public_error
 from plex_queue.service import Clarify, Service
-from plex_queue.titles import kind_word, parse_request
+from plex_queue.titles import (
+    all_of_me_title,
+    film_show_title,
+    kind_word,
+    parse_request,
+)
 from plex_queue.vm import guest_reachable
 
 log = logging.getLogger(__name__)
@@ -31,7 +36,7 @@ log = logging.getLogger(__name__)
 HELP = """\
 Send a title, or an IMDB link such as https://www.imdb.com/title/tt0133093/
 
-A link tells me the exact movie or show. A bare title asks you to pick movie or TV show before I check Plex. A season or episode, like S01 or S01E03, is treated as a show. A bare show name lists what you have and asks for a season before anything is queued.
+A link tells me the exact movie or show. A bare title asks you to pick movie or TV show before I check Plex. Saying TV show (or all/every seasons) fills missing seasons. A season or episode, like S01 or S01E03, queues that season only.
 
 /active  downloads in progress
 /queue   waiting, paused, and checking
@@ -480,8 +485,20 @@ def build_application(config: Config, service: Service, access: Access, importer
         limit = 30 if is_owner else config.guest_hourly_limit
         # Collection / "all seasons" sweeps fan out many nested lookups; charge more.
         # Guests: one collection sweep per hour at the default limit of 5.
+        # Picking "TV show" on a bare title also fills all seasons.
         preview = parse_request(query)
-        if preview.collection:
+        title = " ".join(
+            str(preview.franchise or " ".join(preview.tokens)).split()
+        )
+        film = bool(all_of_me_title(title) or film_show_title(title))
+        # Film exceptions stay a single lookup even if the user picked TV show.
+        fills_show = (
+            kind == "show"
+            and preview.season is None
+            and preview.episode is None
+            and not film
+        )
+        if (preview.collection or fills_show) and not film:
             cost = 10 if is_owner else limit
         else:
             cost = 1

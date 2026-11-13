@@ -350,4 +350,7 @@ def _config(tmp_path: Path, owner_id: int = 0, allowed: tuple[int, ...] = ()) ->
         tidy_buckets={},
         guest_hourly_limit=5,
         guest_max_active=3,
+        otel_enabled=False,
+        otel_endpoint="http://127.0.0.1:4317",
+        otel_service_name="plex-queue",
     )

@@ -15,7 +15,7 @@ from plex_queue.importer import Importer, send_telegram
 from plex_queue.ledger import Ledger
 from plex_queue.library import Library
 from plex_queue.plexscan import PlexScan, read_plex_token
-from plex_queue.search import fetch_hits
+from plex_queue.search import search_hits
 from plex_queue.service import Service
 from plex_queue.securefs import protect_dir, protect_file
 from plex_queue.sshutil import ensure_known_host
@@ -61,11 +61,20 @@ def main(argv: list[str] | None = None) -> None:
             "Choose a private telegram.setup_secret (16+ characters) in config.yaml, "
             "then restart the bot."
         )
+    from plex_queue import __version__
+    from plex_queue.otel_setup import setup_otel, shutdown_otel
+
     _boot(config)
     _pin_host(config)
+    setup_otel(
+        enabled=config.otel_enabled,
+        endpoint=config.otel_endpoint,
+        service_name=config.otel_service_name,
+        service_version=__version__,
+    )
     library = Library(config.plex_db, list(config.roots))
-    search = _Search(config.search_endpoint)
     deluge = Deluge(config)
+    search = _Search(config, deluge)
     access = Access(config)
     ledger = Ledger(config.data_dir / "imports.json", secret=config.setup_secret)
     tidy_ledger = TidyLedger(config.data_dir / "tidy.json", secret=config.setup_secret)
@@ -118,6 +127,7 @@ def main(argv: list[str] | None = None) -> None:
     finally:
         stop.set()
         deluge.close()
+        shutdown_otel()
 
 
 def _owner_service(config) -> tuple[Service, int]:
@@ -146,7 +156,7 @@ def _owner_service(config) -> tuple[Service, int]:
 
     service = Service(
         library,
-        _Search(config.search_endpoint),
+        _Search(config),
         _NoDeluge(),
         config.min_height,
         access,
@@ -214,7 +224,7 @@ def boost_cli(config) -> None:
     try:
         service = Service(
             library,
-            _Search(config.search_endpoint),
+            _Search(config, deluge),
             deluge,
             config.min_height,
             access,
@@ -324,11 +334,19 @@ def _pin_host(config) -> None:
 
 
 class _Search:
-    def __init__(self, endpoint: str):
-        self.endpoint = endpoint
+    def __init__(self, config, deluge: Deluge | None = None):
+        self.config = config
+        self._deluge = deluge
 
     def search(self, query: str, match_as: str | None = None):
-        return fetch_hits(query, self.endpoint, match_as=match_as)
+        ensure = self._deluge.ensure_tunnel if self._deluge is not None else None
+        return search_hits(
+            query,
+            self.config.search_endpoint,
+            torznab=self.config.torznab,
+            match_as=match_as,
+            ensure_tunnel=ensure,
+        )
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ Send a title in Telegram. A bare title asks whether it is a movie or a TV show b
 - `/active`, `/queue`, and `/done` show Deluge. The owner can `/rm` a torrent.
 - Every 10 minutes, while the VM is already on, finished downloads are copied to the movie or show drive with enough free space (2 GB left over). The copy on the VM is then removed, and Plex scans the new folder. Kids, anime, documentary, and the other special libraries are left alone. Change the `import:` folders in `config.yaml` to pick different drives. File paths that climb out of the download folder, or that would write outside the chosen library root, are refused.
 - After Plex is serving a higher-quality upgrade, the owner can `/upgrades` and `/drop` the old copy to the Recycle Bin (not hard-deleted).
-- Structured JSON events are logged on the `plex_queue.events` logger (`tidy.audit`, `tidy.apply`, `plex.refresh_all`, `import.cycle`, `upgrade.drop`, …) so a future Kafka → Grafana / autotick pipeline can subscribe without rewriting call sites.
+- Structured JSON events are logged on the `plex_queue.events` logger (`tidy.audit`, `tidy.apply`, `plex.refresh_all`, `import.cycle`, `upgrade.drop`, …). With `otel.enabled: true` and `pip install -e ".[otel]"`, those events (plus traces/metrics) export over OTLP to the local stack in [`observability/`](observability/) (Collector → Kafka + Prometheus/Loki/Tempo → Grafana).
 
 Other people can request titles after you `/allow` their Telegram id. Only the owner can remove torrents, tidy/refresh the library, or change who is allowed.
 
@@ -106,6 +106,17 @@ Guests who are `/allow`ed can request titles and view queue status; they cannot 
 7. Message the bot `/claim your-secret`, then `/whoami` from anyone else and `/allow` that id.
 
 `scripts\install-task.ps1` starts the bot when you sign in to Windows.
+
+### Observability (optional)
+
+```powershell
+cd observability
+docker compose up -d
+.\.venv\Scripts\pip.exe install -e ".[otel]"
+# set otel.enabled: true in config.yaml, then restart the bot
+```
+
+Grafana: [http://127.0.0.1:3001](http://127.0.0.1:3001) (default `admin`/`admin`). Details in [`observability/README.md`](observability/README.md). Docker is separate from the Scheduled Task.
 
 The Deluge password is the `localclient` value in `~/.config/deluge/auth` on the VM. The bot never needs the `.torrent` file. It sends a magnet to the daemon, and the download stays on the VM.
 

@@ -47,7 +47,7 @@ def ensure_known_host(
     allow_tofu: bool = False,
     keyscan: str | None = None,
     ssh: str | None = None,
-    run=subprocess.run,
+    run=None,
 ) -> bool:
     """Pin the VM host key once. Later connects refuse a changed key.
 
@@ -56,6 +56,10 @@ def ensure_known_host(
     pin via keyscan or a trusted manual known_hosts entry. Fingerprints are
     logged so the first pin can be verified out of band.
     """
+    if run is None:
+        from plex_queue.winproc import run as hidden_run
+
+        run = hidden_run
     if not host.strip():
         return False
     if host_pinned(host, known_hosts):
@@ -152,7 +156,11 @@ def _log_fingerprints(host: str, known_hosts: Path, *, source: str, run) -> None
         )
 
 
-def host_fingerprints(host: str, known_hosts: Path, run=subprocess.run) -> list[str]:
+def host_fingerprints(host: str, known_hosts: Path, run=None) -> list[str]:
+    if run is None:
+        from plex_queue.winproc import run as hidden_run
+
+        run = hidden_run
     if not known_hosts.exists():
         return []
     keygen = shutil.which("ssh-keygen") or _default_keygen()

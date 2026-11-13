@@ -5,17 +5,25 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from plex_queue.titles import (
+    ALL_SEASONS,
     EP_WORD,
     IMDB_ID,
     IMDB_URL,
+    KIND_BEFORE_SEASON,
     LEADING_KIND,
     SEASON_EP,
     SEASON_ONLY,
     SEASON_WORD,
     TAGS,
+    TRAILING_ALL_KIND,
+    TRAILING_ALL_SEASONS,
     TRAILING_MOVIE,
+    TRAILING_SET_MOVIE,
+    TRAILING_SET_SHOW,
+    TRAILING_SHOW,
     X_EP,
     YEAR,
+    _set_subject,
     parse_request,
 )
 
@@ -79,8 +87,23 @@ def cleaned_title(text: str) -> str:
         work = work[: -len(suffix)]
     work = IMDB_URL.sub(" ", work)
     work = IMDB_ID.sub(" ", work)
+    leading_pack = ALL_SEASONS.match(work)
+    if leading_pack:
+        work = leading_pack.group(1).strip()
+        work = TRAILING_SET_SHOW.sub("", work)
+        work = TRAILING_SET_MOVIE.sub("", work)
+    work = TRAILING_ALL_KIND.sub(" ", work)
+    work = TRAILING_ALL_SEASONS.sub(" ", work)
+    # Mirror parse_request rescue: "watch all of the office all tv shows".
+    embedded = re.search(r"(?i)\b((?:all|every)\s+of\s+.+)$", work)
+    if embedded:
+        subject, _ = _set_subject(embedded.group(1).strip())
+        if subject:
+            work = subject
     work = LEADING_KIND.sub(" ", work)
     work = TRAILING_MOVIE.sub(" ", work)
+    work = TRAILING_SHOW.sub(" ", work)
+    work = KIND_BEFORE_SEASON.sub(" ", work)
     work = SEASON_EP.sub(" ", work)
     work = X_EP.sub(" ", work)
     work = SEASON_WORD.sub(" ", work)
