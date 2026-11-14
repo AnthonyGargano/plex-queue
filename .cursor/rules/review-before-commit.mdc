@@ -1,11 +1,11 @@
 ---
-description: Require Bugbot and Security Review before any commit; fix and re-run until clean
+description: After any code change, run Bugbot and Security Review recursively until clean
 alwaysApply: true
 ---
 
-# Review gate before commit
+# Review gate after every code change
 
-Treat **Bugbot** and **Security Review** as a hard gate on every code change in this repo.
+Treat **Bugbot** and **Security Review** as a hard gate on every code change in this repo — not only before commits.
 
 ## Required
 
@@ -13,9 +13,10 @@ Treat **Bugbot** and **Security Review** as a hard gate on every code change in 
 2. Fix every real finding. Re-run both reviews until:
    - Bugbot reports no bugs
    - Security Review reports no issues
-3. **Do not create a git commit**, amend, or push until both reviews are clean for that diff.
-4. Do not treat “tests passed” or “lints clean” as a substitute for these reviews.
-5. If the user asks to commit/push and reviews are not done or not clean, run the review loop first (or refuse the commit until it passes).
+3. Recurse: change → review → fix → review again, until both are clean. Do not stop after one pass if findings remain.
+4. **Do not create a git commit**, amend, or push until both reviews are clean for that diff.
+5. Do not treat “tests passed” or “lints clean” as a substitute for these reviews.
+6. If the user asks to commit/push and reviews are not done or not clean, run the review loop first (or refuse the commit until it passes).
 
 ## Security focus (always)
 

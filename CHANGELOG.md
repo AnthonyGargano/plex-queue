@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Batch `/tidy apply` (and `/tidy orphans`) lists each done/failed action; `/tidy last` re-shows that report.
+
 ## 0.1.0
 
 ### Library tidy

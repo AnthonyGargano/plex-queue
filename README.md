@@ -49,9 +49,12 @@ The owner can `/tidy` (or CLI `python -m plex_queue tidy`) to audit existing lib
 /tidy apply orphans          # or: tidy apply orphans
 /tidy apply renames 50
 /tidy apply moves 1-20
+/tidy last                   # re-show the last apply report
 /tidy skip <id>
 /tidy skip renames all
 ```
+
+Batch apply replies list each done/failed action (not only the counts). `/tidy last` re-shows that report.
 
 Selectors: `50` | `1-100` | `1:50` | `1,5,987` | `s01` | `s01:05` | `s01e03` | `all`
 

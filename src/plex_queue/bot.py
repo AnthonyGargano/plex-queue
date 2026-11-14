@@ -77,6 +77,7 @@ OWNER_HELP = """\
 /tidy apply renames 50   /tidy apply moves 1-20
 /tidy apply renames all  /tidy skip renames all
 /tidy orphans  ask Plex to scan orphan folders
+/tidy last  re-show the last apply report
 /tidy skip <id>  dismiss a proposal
 Renames only strip movie release-junk folders; sample before renames all.
 /import  run one import cycle now (copy finished downloads, scan Plex)
@@ -370,6 +371,9 @@ def build_application(config: Config, service: Service, access: Access, importer
             await reply(update, "Working on orphan scans...")
             await reply(update, await _work(lambda: service.tidy_apply("orphans", uid), tidy=True))
             return
+        if verb in {"last", "report", "log"}:
+            await reply(update, await _work(lambda: service.tidy_last(uid), tidy=True))
+            return
         if verb in {"refresh", "audit"}:
             await reply(update, "Auditing the library...")
             await reply(update, await _work(lambda: service.tidy(uid, refresh=True), tidy=True))
@@ -382,6 +386,7 @@ def build_application(config: Config, service: Service, access: Access, importer
             "/tidy apply renames 50\n"
             "/tidy apply moves 1-20\n"
             "/tidy orphans\n"
+            "/tidy last\n"
             "/tidy skip <id>\n"
             "/tidy skip renames all",
         )

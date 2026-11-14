@@ -494,7 +494,7 @@ def format_report(
         lines.append(f"Blocked/report-only: {blocked}")
     lines.append(
         "Owner commands: /tidy apply <id>   /tidy skip <id>\n"
-        "/tidy apply dupes   /tidy orphans\n"
+        "/tidy apply dupes   /tidy orphans   /tidy last\n"
         "/tidy apply renames 50   /tidy apply moves 1-20\n"
         "/tidy apply renames 1,5,9   /tidy skip renames all\n"
         "Selectors: 50 | 1-100 | 1:50 | 1,5,987 | s01 | s01:05 | s01e03 | all"
@@ -552,6 +552,27 @@ def _action_line(row: dict, index: int | None = None) -> str:
     if dest:
         bits.append(f"  dest: {dest}")
     return "\n".join(bits)
+
+
+def format_apply_result(action_id: str, row: dict, message: str) -> str:
+    """Compact one-action outcome for batch apply / ``/tidy last`` reports."""
+    kind = str(row.get("kind") or "?")
+    title = str(row.get("title") or "").strip()
+    first = ""
+    for line in str(message or "").splitlines():
+        line = line.strip()
+        if line:
+            first = line
+            break
+    header = f"{action_id}  [{kind}]"
+    if title:
+        header = f"{header}  {title}"
+    if not first:
+        return header
+    # Avoid repeating the same words when the apply message is already the title.
+    if title and first.casefold() == title.casefold():
+        return header
+    return f"{header}\n  {first}"
 
 
 def _duplicate_actions(

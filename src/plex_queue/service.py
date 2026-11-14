@@ -44,6 +44,7 @@ from plex_queue.events import duration_ms, emit, timed
 from plex_queue.tidy import (
     apply_action,
     audit,
+    format_apply_result,
     format_report,
     upgrade_replace_paths,
 )
@@ -1250,6 +1251,7 @@ class Service:
                 "/tidy orphans\n"
                 "/tidy apply renames 50\n"
                 "/tidy apply moves 1-20\n"
+                "/tidy last\n"
                 "Selectors: 50 | 1-100 | 1:50 | 1,5,987 | s01 | s01:05 | all"
             )
         with self._lock:
@@ -1311,7 +1313,20 @@ class Service:
                     confidence=row.get("confidence") or "plex",
                     duration_ms=duration_ms(started),
                 )
-                return f"Applied {action_id}.\n{message}"
+                text = f"Applied {action_id}.\n{message}"
+                self.tidy_ledger.remember_last_apply(text)
+                return text
+
+    def tidy_last(self, user_id: int = 0) -> str:
+        """Re-show the most recent apply summary (owner-only)."""
+        if self.access is None or not self.access.is_owner(user_id):
+            return "Only the owner can do that."
+        if self.tidy_ledger is None:
+            return "Tidy review is not set up."
+        report = self.tidy_ledger.last_apply_report()
+        if not report:
+            return "No apply report yet. Run /tidy apply … or /tidy orphans first."
+        return report
 
     def tidy_skip(self, needle: str, user_id: int = 0) -> str:
         if self.access is None or not self.access.is_owner(user_id):
@@ -1372,6 +1387,7 @@ class Service:
         started = timed()
         ok = 0
         failed = 0
+        successes: list[str] = []
         failures: list[str] = []
         upgrade_paths = self._upgrade_paths()
         interrupted = False
@@ -1379,7 +1395,7 @@ class Service:
             for index, row in enumerate(chosen, start=1):
                 action_id = str(row.get("id") or "")
                 try:
-                    apply_action(
+                    message = apply_action(
                         row,
                         roots=self.roots,
                         trash_dir=self.trash_dir,
@@ -1395,12 +1411,12 @@ class Service:
                 except (OSError, sqlite3.Error) as exc:
                     self.tidy_ledger.mark(action_id, status="failed", error=public_error(exc))
                     failed += 1
-                    if len(failures) < 15:
-                        failures.append(f"{action_id}: failed — {public_error(exc)}")
+                    failures.append(f"{action_id}: failed — {public_error(exc)}")
                     continue
                 self.tidy_ledger.mark(action_id, status="done")
                 self.tidy_ledger.cancel_related(row.get("source"), except_id=action_id)
                 ok += 1
+                successes.append(format_apply_result(action_id, row, message))
                 if index % 25 == 0 or index == len(chosen):
                     log.info(
                         "tidy apply progress: %s/%s ok=%s failed=%s",
@@ -1431,13 +1447,19 @@ class Service:
             ]
         else:
             lines = [f"Applied {ok} action(s), {failed} failed (of {len(chosen)})."]
+        if successes:
+            lines.append("")
+            lines.append("Done:")
+            lines.extend(successes)
         if failures:
             lines.append("")
+            lines.append("Failed:")
             lines.extend(failures)
-            leftover = failed - len(failures)
-            if leftover > 0:
-                lines.append(f"…and {leftover} more failures")
-        return "\n".join(lines)
+        lines.append("")
+        lines.append("Re-show with /tidy last")
+        report = "\n".join(lines)
+        self.tidy_ledger.remember_last_apply(report)
+        return report
 
     def _tidy_skip_many(
         self, kinds: set[str], user_id: int, *, selector: str = "",

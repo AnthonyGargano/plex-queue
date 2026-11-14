@@ -155,6 +155,31 @@ class TidyLedger:
             value = self._ensure().get("audited_at")
         return str(value) if value else None
 
+    def remember_last_apply(self, report: str) -> None:
+        """Persist the latest apply summary for ``/tidy last``."""
+        text = str(report or "").strip()
+        if not text:
+            return
+        with self._lock:
+            data = self._ensure()
+            data["last_apply"] = {"at": utc_now_iso(), "report": text}
+            self._dirty = True
+            self._flush_unlocked()
+
+    def last_apply_report(self) -> str | None:
+        """Return the stored apply summary, or None if none yet."""
+        with self._lock:
+            blob = self._ensure().get("last_apply")
+        if not isinstance(blob, dict):
+            return None
+        report = str(blob.get("report") or "").strip()
+        if not report:
+            return None
+        at = blob.get("at")
+        if at:
+            return f"Last apply ({at}):\n{report}"
+        return report
+
     def flush(self) -> None:
         with self._lock:
             self._flush_unlocked()

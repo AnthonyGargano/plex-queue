@@ -1,0 +1,10 @@
+---
+description: If a mode switch is unanswered, pick the best mode and continue
+alwaysApply: true
+---
+
+# Mode switch default
+
+If you propose or request a switch to Plan (or another mode) and the user does not clearly accept or reject it, do not wait. Choose the mode that best fits the task and continue working.
+
+Prefer Agent for implementation; use Plan only when tradeoffs are genuinely ambiguous and blocking.

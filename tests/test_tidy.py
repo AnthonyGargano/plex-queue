@@ -15,6 +15,7 @@ from plex_queue.tidy import (
     classify_copy,
     derive_buckets,
     expected_path,
+    format_apply_result,
     format_report,
 )
 from plex_queue.tidy_ledger import TidyLedger
@@ -1305,6 +1306,85 @@ def test_failed_action_can_be_reproposed(tmp_path):
     ledger.mark("fail1234", status="failed", error="token missing")
     ledger.replace_pending([{**row, "status": "pending"}])
     assert ledger.get("fail1234")["status"] == "pending"
+
+
+def test_format_apply_result_includes_outcome():
+    text = format_apply_result(
+        "scan0001",
+        {"kind": "scan", "title": "Film"},
+        "Asked Plex to scan D:/Movies/Film",
+    )
+    assert "scan0001" in text
+    assert "[scan]" in text
+    assert "Film" in text
+    assert "Asked Plex to scan" in text
+
+
+def test_last_apply_report_roundtrip(tmp_path):
+    ledger = TidyLedger(tmp_path / "tidy.json")
+    assert ledger.last_apply_report() is None
+    ledger.remember_last_apply("Applied 2 action(s), 0 failed (of 2).\n\nDone:\na")
+    report = ledger.last_apply_report()
+    assert report is not None
+    assert "Last apply" in report
+    assert "Done:" in report
+    assert report.endswith("a") or "\na" in report
+
+
+def test_batch_apply_lists_done_actions_and_tidy_last(tmp_path):
+    root = tmp_path / "Movies"
+    orphan = root / "Orphan Film"
+    orphan.mkdir(parents=True)
+    (orphan / "clip.mkv").write_bytes(b"x" * 10)
+    config = _config(tmp_path, owner_id=42)
+    access = Access(config)
+    tidy_ledger = TidyLedger(tmp_path / "tidy.json")
+    tidy_ledger.replace_pending(
+        [
+            {
+                "id": "scanabcd",
+                "kind": "scan",
+                "priority": 2,
+                "title": "Orphan Film",
+                "detail": "1 file(s) on disk but not in Plex",
+                "source": str(orphan),
+                "dest": str(orphan),
+                "status": "pending",
+            }
+        ]
+    )
+
+    class OkPlex:
+        def refresh_dirs(self, directories):
+            return [f"Asked Plex to scan {directories[0]}"], list(directories)
+
+    from plex_queue.library import Library
+
+    library = Library(tmp_path / "plex.db", [root])
+    library.copies = []
+    library.loaded = True
+    service = Service(
+        library,
+        search=None,
+        deluge=_NoDeluge(),
+        access=access,
+        roots=[root],
+        trash_dir=tmp_path / "trash",
+        tidy_ledger=tidy_ledger,
+        plex=OkPlex(),
+        tidy_buckets=derive_buckets([root], movie_dirs=[root]),
+        plex_db=tmp_path / "plex.db",
+    )
+    assert "No apply report" in service.tidy_last(user_id=42)
+    result = service.tidy_apply("orphans", user_id=42)
+    assert "Applied 1 action(s), 0 failed" in result
+    assert "Done:" in result
+    assert "scanabcd" in result
+    assert "Asked Plex to scan" in result
+    assert "/tidy last" in result
+    again = service.tidy_last(user_id=42)
+    assert "scanabcd" in again
+    assert "Only the owner" in service.tidy_last(user_id=7)
 
 
 def _plex_versions(db: Path, rows):

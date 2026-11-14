@@ -185,6 +185,9 @@ def tidy_cli(config, argv: list[str] | None = None) -> None:
     if verb in {"apply", "do"}:
         print(service.tidy_apply(rest or "", owner))
         return
+    if verb in {"last", "report", "log"}:
+        print(service.tidy_last(owner))
+        return
     if verb in {"skip", "keep"}:
         if not rest:
             raise SystemExit("Usage: python -m plex_queue tidy skip <id>")
@@ -193,9 +196,13 @@ def tidy_cli(config, argv: list[str] | None = None) -> None:
     if verb in {"refresh", "audit"}:
         print(service.tidy(owner, refresh=True))
         return
+    if verb in {"orphans", "orphan"}:
+        print(service.tidy_apply("orphans", owner))
+        return
     raise SystemExit(
         "Usage: python -m plex_queue tidy\n"
         "       python -m plex_queue tidy apply <id|dupes|orphans>\n"
+        "       python -m plex_queue tidy last\n"
         "       python -m plex_queue tidy skip <id>"
     )
 
