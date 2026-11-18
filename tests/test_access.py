@@ -6,7 +6,7 @@ from pathlib import Path
 from plex_queue.access import Access
 from plex_queue.bot import Limiter
 from plex_queue.config import Config
-from plex_queue.sshutil import ensure_known_host, host_pinned, ssh_options
+from plex_queue.sshutil import adopt_pinned_address, ensure_known_host, host_pinned, ssh_options
 
 
 def test_claim_is_first_writer_wins(tmp_path):
@@ -198,6 +198,92 @@ def test_ensure_known_host_writes_and_detects_the_pin(tmp_path):
     assert host_pinned("172.30.161.89", known)
     assert "evil.example" not in known.read_text(encoding="utf-8")
     assert ensure_known_host("172.30.161.89", known, keyscan="ssh-keyscan", run=run)
+
+
+_PINNED_KEY = "AAAAC3NzaC1lZDI1NTE5AAAAIFakeKeyForTestsOnly0000000000000000"
+
+
+def test_adopt_pinned_address_copies_a_matching_key(tmp_path):
+    known = tmp_path / "ssh_known_hosts"
+    known.write_text(
+        f"172.30.161.89 ssh-ed25519 {_PINNED_KEY}\n",
+        encoding="utf-8",
+    )
+    called = {"n": 0}
+
+    def probe(host):
+        called["n"] += 1
+        return [f"{host} ssh-ed25519 {_PINNED_KEY}"]
+
+    assert adopt_pinned_address("172.23.33.12", known, probe=probe)
+    assert host_pinned("172.23.33.12", known)
+    assert host_pinned("172.30.161.89", known)
+    text = known.read_text(encoding="utf-8")
+    assert "evil" not in text
+    assert called["n"] == 1
+    assert adopt_pinned_address("172.23.33.12", known, probe=lambda _host: ["nope"])
+    assert called["n"] == 1
+
+
+def test_adopt_pinned_address_refuses_a_different_key(tmp_path):
+    known = tmp_path / "ssh_known_hosts"
+    known.write_text(
+        f"172.30.161.89 ssh-ed25519 {_PINNED_KEY}\n",
+        encoding="utf-8",
+    )
+    before = known.read_text(encoding="utf-8")
+
+    def probe(host):
+        return [f"{host} ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDifferentKeyNotTrusted00000000000000"]
+
+    assert not adopt_pinned_address("172.23.33.12", known, probe=probe)
+    assert known.read_text(encoding="utf-8") == before
+    assert not host_pinned("172.23.33.12", known)
+
+
+def test_adopt_pinned_address_does_not_probe_without_a_pin(tmp_path):
+    known = tmp_path / "ssh_known_hosts"
+    known.write_text("", encoding="utf-8")
+
+    def probe(_host):
+        raise AssertionError("should not probe")
+
+    assert not adopt_pinned_address("172.23.33.12", known, probe=probe)
+    assert not adopt_pinned_address("evil.example", known, probe=probe)
+
+
+def test_host_key_probe_does_not_send_a_client_key(tmp_path):
+    known = tmp_path / "ssh_known_hosts"
+    known.write_text(
+        f"172.30.161.89 ssh-ed25519 {_PINNED_KEY}\n",
+        encoding="utf-8",
+    )
+    seen = {}
+
+    def run(command, capture_output, text, check):
+        seen["command"] = list(command)
+        path = ""
+        for part in command:
+            if str(part).startswith("UserKnownHostsFile="):
+                path = str(part).split("=", 1)[1]
+        Path(path).write_text(
+            f"172.23.33.12 ssh-ed25519 {_PINNED_KEY}\n",
+            encoding="utf-8",
+        )
+
+        class Completed:
+            stdout = ""
+            stderr = "Permission denied"
+            returncode = 255
+
+        return Completed()
+
+    assert adopt_pinned_address("172.23.33.12", known, ssh="ssh", run=run)
+    command = seen["command"]
+    assert "-i" not in command
+    assert "PreferredAuthentications=none" in command
+    assert "IdentitiesOnly=yes" in command
+    assert not any("plex-queue_ed25519" in str(part) for part in command)
 
 
 def test_ensure_known_host_tofu_requires_allow_flag(tmp_path):

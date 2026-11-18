@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import hmac
 import logging
 import os
 import re
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -22,6 +24,112 @@ def ssh_options(known_hosts: Path) -> list[str]:
         "-o", f"UserKnownHostsFile={known_hosts}",
         "-o", f"GlobalKnownHostsFile={empty}",
     ]
+
+
+def adopt_pinned_address(
+    host: str,
+    known_hosts: Path,
+    *,
+    ssh: str | None = None,
+    run=None,
+    probe=None,
+) -> bool:
+    """Pin ``host`` only when its key matches one already in known_hosts.
+
+    Windows ssh-keyscan cannot negotiate this VM's key exchange, so the probe
+    is an SSH connection that offers no identity. The real login key is never
+    sent. A different host key is refused and not written.
+    """
+    from plex_queue.vm import usable_guest_ipv4
+
+    if not usable_guest_ipv4(host):
+        return False
+    if host_pinned(host, known_hosts):
+        return True
+    pinned = _key_materials(known_hosts)
+    if not pinned:
+        return False
+    if probe is None:
+        lines = _probe_host_keys(host, ssh=ssh, run=run)
+    else:
+        lines = list(probe(host))
+    accepted = []
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 3 or parts[0].startswith("#") or parts[0].startswith("|"):
+            continue
+        names = parts[0].lower().split(",")
+        if host.strip().lower() not in names:
+            continue
+        if not _material_pinned(parts[1], parts[2], pinned):
+            continue
+        accepted.append(f"{host} {parts[1]} {parts[2]}")
+    if not accepted:
+        log.error(
+            "Refusing %s: SSH host key does not match a key already pinned",
+            host,
+        )
+        return False
+    _append_lines(known_hosts, accepted)
+    log.info("Pinned the existing VM host key for new address %s", host)
+    return host_pinned(host, known_hosts)
+
+
+def _key_materials(known_hosts: Path) -> set[tuple[str, str]]:
+    if not known_hosts.exists():
+        return set()
+    found: set[tuple[str, str]] = set()
+    for line in known_hosts.read_text(encoding="utf-8").splitlines():
+        parts = line.split()
+        if len(parts) < 3 or parts[0].startswith("#"):
+            continue
+        found.add((parts[1], parts[2]))
+    return found
+
+
+def _material_pinned(key_type: str, blob: str, pinned: set[tuple[str, str]]) -> bool:
+    for known_type, known_blob in pinned:
+        if len(known_type) != len(key_type) or len(known_blob) != len(blob):
+            continue
+        if hmac.compare_digest(known_type, key_type) and hmac.compare_digest(known_blob, blob):
+            return True
+    return False
+
+
+def _probe_host_keys(host: str, *, ssh: str | None, run) -> list[str]:
+    """Read the server host key without presenting a client identity."""
+    if run is None:
+        from plex_queue.winproc import run as hidden_run
+
+        run = hidden_run
+    client = ssh or shutil.which("ssh") or r"C:\Windows\System32\OpenSSH\ssh.exe"
+    empty = "NUL" if os.name == "nt" else "/dev/null"
+    handle = tempfile.NamedTemporaryFile(prefix="plex-queue-hostkey-", delete=False)
+    path = Path(handle.name)
+    handle.close()
+    try:
+        command = [
+            client,
+            "-o", "PreferredAuthentications=none",
+            "-o", "BatchMode=yes",
+            "-o", "IdentitiesOnly=yes",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", f"UserKnownHostsFile={path}",
+            "-o", f"GlobalKnownHostsFile={empty}",
+            "-o", "ConnectTimeout=8",
+            f"probe@{host}",
+            "true",
+        ]
+        run(command, capture_output=True, text=True, check=False)
+        if not path.exists():
+            return []
+        return [
+            line.strip()
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+    finally:
+        path.unlink(missing_ok=True)
 
 
 def host_pinned(host: str, known_hosts: Path) -> bool:

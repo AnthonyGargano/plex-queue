@@ -18,9 +18,9 @@ from plex_queue.plexscan import PlexScan, read_plex_token
 from plex_queue.search import search_hits
 from plex_queue.service import Service
 from plex_queue.securefs import protect_dir, protect_file
-from plex_queue.sshutil import ensure_known_host
+from plex_queue.sshutil import adopt_pinned_address, ensure_known_host, host_pinned
 from plex_queue.tidy_ledger import TidyLedger
-from plex_queue.vm import ensure_running, guest_reachable
+from plex_queue.vm import GuestAddress, ensure_running, guest_answering
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -64,8 +64,10 @@ def main(argv: list[str] | None = None) -> None:
     from plex_queue import __version__
     from plex_queue.otel_setup import setup_otel, shutdown_otel
 
-    _boot(config)
+    address = GuestAddress(config.ssh_host)
+    _boot(config, address)
     _pin_host(config)
+    _pin_current(config, address)
     setup_otel(
         enabled=config.otel_enabled,
         endpoint=config.otel_endpoint,
@@ -73,7 +75,7 @@ def main(argv: list[str] | None = None) -> None:
         service_version=__version__,
     )
     library = Library(config.plex_db, list(config.roots))
-    deluge = Deluge(config)
+    deluge = Deluge(config, address)
     search = _Search(config, deluge)
     access = Access(config)
     ledger = Ledger(config.data_dir / "imports.json", secret=config.setup_secret)
@@ -104,12 +106,13 @@ def main(argv: list[str] | None = None) -> None:
         transport=SshFetch(
             config.ssh_key, config.ssh_user, config.ssh_host, config.ssh_known_hosts,
             download_roots=download_roots(config),
+            address=address,
         ),
         plex=plex,
         notify=lambda text: send_telegram(
             config.token, access.owner_id or config.owner_id, text,
         ),
-        reachable=lambda: guest_reachable(config.ssh_host, 22),
+        reachable=lambda: guest_answering(config.vm_name, address.current, 22),
         library=library,
         vm_name=config.vm_name,
         interval=config.import_every,
@@ -119,7 +122,7 @@ def main(argv: list[str] | None = None) -> None:
         library_roots=config.roots,
         booster=lambda: service.boost_stuck(only_when_added=True),
     )
-    app = build_application(config, service, access, importer)
+    app = build_application(config, service, access, importer, address)
     stop = threading.Event()
     threading.Thread(target=importer.serve, args=(stop,), name="plex-queue-import", daemon=True).start()
     try:
@@ -295,7 +298,7 @@ def check(config) -> None:
     print(f"Deluge connected: {len(torrents)} torrents")
 
 
-def _boot(config) -> None:
+def _boot(config, address: GuestAddress | None = None) -> None:
     if config.ssh_allow_tofu:
         logging.warning(
             "deluge.ssh.allow_tofu is enabled — first host-key pin can be MITMed; "
@@ -307,7 +310,7 @@ def _boot(config) -> None:
         )
     logging.info("Checking %s", config.vm_name)
     try:
-        status = ensure_running(config.vm_name, config.ssh_host)
+        status = ensure_running(config.vm_name, config.ssh_host, address=address)
     except DelugeError as exc:
         logging.error("%s", exc)
         print(exc)
@@ -315,6 +318,21 @@ def _boot(config) -> None:
     message = f"Started {config.vm_name}." if status == "started" else f"{config.vm_name} is running."
     logging.info(message)
     print(message)
+
+
+def _pin_current(config, address: GuestAddress | None) -> None:
+    """Record a DHCP address when its key matches the key already pinned."""
+    if address is None:
+        return
+    host = address.current
+    if not host or host == config.ssh_host or host_pinned(host, config.ssh_known_hosts):
+        return
+    if not adopt_pinned_address(host, config.ssh_known_hosts):
+        raise SystemExit(
+            f"{host} answered for {config.vm_name}, but its SSH host key does not match the pinned key."
+        )
+    protect_file(config.ssh_known_hosts)
+    logging.info("Pinned the existing VM host key for %s", host)
 
 
 def _pin_host(config) -> None:

@@ -4,7 +4,13 @@ from plex_queue.library import Library
 from plex_queue.models import Copy
 from plex_queue.search import matching_hits
 from plex_queue.service import Service
-from plex_queue.vm import DelugeError, ensure_running
+from plex_queue.vm import (
+    DelugeError,
+    GuestAddress,
+    ensure_running,
+    guest_answering,
+    parse_guest_ips,
+)
 from plex_queue.models import Hit
 
 
@@ -44,11 +50,15 @@ def ports(*answers):
     return reachable
 
 
+def no_addresses(_name):
+    return []
+
+
 def test_reachable_guest_is_left_alone():
     vm = FakeVm(["Off"])
     status = ensure_running(
         "UbuntuClean", "127.0.0.1", control=vm, reachable=ports(True),
-        sleep=lambda _s: None, clock=lambda: 0, timeout=5,
+        sleep=lambda _s: None, clock=lambda: 0, timeout=5, discover=no_addresses,
     )
     assert status == "running"
     assert vm.started == 0
@@ -60,7 +70,7 @@ def test_off_vm_is_started_and_then_waited_on():
     status = ensure_running(
         "UbuntuClean", "172.30.161.89", control=vm,
         reachable=ports(False, False, True),
-        sleep=clock.sleep, clock=clock.time, timeout=30,
+        sleep=clock.sleep, clock=clock.time, timeout=30, discover=no_addresses,
     )
     assert status == "started"
     assert vm.started == 1
@@ -72,7 +82,7 @@ def test_paused_vm_is_resumed():
     status = ensure_running(
         "UbuntuClean", "172.30.161.89", control=vm,
         reachable=ports(False, False, True),
-        sleep=clock.sleep, clock=clock.time, timeout=30,
+        sleep=clock.sleep, clock=clock.time, timeout=30, discover=no_addresses,
     )
     assert status == "started"
     assert vm.resumed == 1
@@ -85,7 +95,7 @@ def test_running_vm_waits_for_ssh_without_starting():
     status = ensure_running(
         "UbuntuClean", "172.30.161.89", control=vm,
         reachable=ports(False, False, True),
-        sleep=clock.sleep, clock=clock.time, timeout=30,
+        sleep=clock.sleep, clock=clock.time, timeout=30, discover=no_addresses,
     )
     assert status == "running"
     assert vm.started == 0
@@ -97,7 +107,7 @@ def test_stopping_vm_is_not_started_until_it_is_off():
     status = ensure_running(
         "UbuntuClean", "172.30.161.89", control=vm,
         reachable=ports(False, False, False, True),
-        sleep=clock.sleep, clock=clock.time, timeout=30,
+        sleep=clock.sleep, clock=clock.time, timeout=30, discover=no_addresses,
     )
     assert status == "started"
     assert vm.started == 1
@@ -110,9 +120,71 @@ def test_timeout_reports_the_vm():
         ensure_running(
             "UbuntuClean", "172.30.161.89", control=vm,
             reachable=lambda host, port: False,
-            sleep=clock.sleep, clock=clock.time, timeout=5,
+            sleep=clock.sleep, clock=clock.time, timeout=5, discover=no_addresses,
         )
     assert vm.started == 1
+
+
+def test_changed_address_is_used_without_starting():
+    vm = FakeVm(["Off"])
+    address = GuestAddress("172.30.161.89")
+
+    def reachable(host, port):
+        return host == "172.23.33.12"
+
+    status = ensure_running(
+        "UbuntuClean", "172.30.161.89", control=vm, reachable=reachable,
+        discover=lambda _name: ["not-an-ip", "169.254.1.1", "172.23.33.12"],
+        sleep=lambda _s: None, clock=lambda: 0, timeout=5, address=address,
+    )
+    assert status == "running"
+    assert vm.started == 0
+    assert address.current == "172.23.33.12"
+
+
+def test_off_vm_answers_on_the_new_address_after_start():
+    clock = Clock()
+    vm = FakeVm(["Off"])
+    address = GuestAddress("172.30.161.89")
+    seen = {"n": 0}
+
+    def discover(_name):
+        seen["n"] += 1
+        if seen["n"] >= 3:
+            return ["172.23.33.12"]
+        return []
+
+    def reachable(host, port):
+        return host == "172.23.33.12" and seen["n"] >= 3
+
+    status = ensure_running(
+        "UbuntuClean", "172.30.161.89", control=vm, reachable=reachable,
+        discover=discover, sleep=clock.sleep, clock=clock.time, timeout=30,
+        address=address,
+    )
+    assert status == "started"
+    assert vm.started == 1
+    assert address.current == "172.23.33.12"
+
+
+def test_guest_answering_accepts_a_discovered_address():
+    def reachable(host, port):
+        return host == "172.23.33.12"
+
+    assert guest_answering(
+        "UbuntuClean", "172.30.161.89", reachable=reachable,
+        discover=lambda _name: ["172.23.33.12"],
+    )
+    assert not guest_answering(
+        "UbuntuClean", "172.30.161.89", reachable=lambda *_: False,
+        discover=no_addresses,
+    )
+
+
+def test_parse_guest_ips_keeps_real_addresses_only():
+    assert parse_guest_ips(
+        ["172.23.33.12", "172.23.33.12", "nope", "169.254.1.1", "127.0.0.1", "8.8.8.8"]
+    ) == ["172.23.33.12", "8.8.8.8"]
 
 
 def test_bad_vm_name_is_rejected():

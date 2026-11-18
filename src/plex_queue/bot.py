@@ -29,7 +29,7 @@ from plex_queue.titles import (
     kind_word,
     parse_request,
 )
-from plex_queue.vm import guest_reachable
+from plex_queue.vm import GuestAddress, guest_answering
 
 log = logging.getLogger(__name__)
 
@@ -112,7 +112,13 @@ LABEL_REPLY = re.compile(
 )
 
 
-def build_application(config: Config, service: Service, access: Access, importer=None) -> Application:
+def build_application(
+    config: Config,
+    service: Service,
+    access: Access,
+    importer=None,
+    address: GuestAddress | None = None,
+) -> Application:
     limiter = Limiter()
     claim_user_limiter = Limiter()
     claim_global_limiter = Limiter()
@@ -441,9 +447,7 @@ def build_application(config: Config, service: Service, access: Access, importer
         if not notes:
             import asyncio
 
-            reachable = await asyncio.to_thread(
-                guest_reachable, config.ssh_host, 22,
-            )
+            reachable = await asyncio.to_thread(_guest_up)
             if not reachable:
                 await reply(
                     update,
@@ -521,10 +525,16 @@ def build_application(config: Config, service: Service, access: Access, importer
         pending.pop(uid, None)
         await reply(update, result)
 
+    def _guest_up() -> bool:
+        host = config.ssh_host
+        if address is not None and address.current:
+            host = address.current
+        return guest_answering(config.vm_name, host, 22)
+
     async def _starting(update: Update) -> None:
         import asyncio
 
-        reachable = await asyncio.to_thread(guest_reachable, config.ssh_host, 22)
+        reachable = await asyncio.to_thread(_guest_up)
         if not reachable:
             await reply(update, f"{config.vm_name} is off. Starting it...")
 

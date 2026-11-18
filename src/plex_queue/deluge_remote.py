@@ -13,18 +13,21 @@ from deluge_client import DelugeRPCClient
 from plex_queue.config import Config
 from plex_queue.models import Torrent, pick_for_removal
 from plex_queue.place import is_complete, parse_finished
-from plex_queue.sshutil import ssh_options
-from plex_queue.vm import DelugeError, ensure_running
+from plex_queue.sshutil import adopt_pinned_address, host_pinned, ssh_options
+from plex_queue.vm import DelugeError, GuestAddress, ensure_running
 
 log = logging.getLogger(__name__)
 
 
 class Deluge:
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, address: GuestAddress | None = None):
         self.config = config
+        self.address = address or GuestAddress(config.ssh_host)
         self._process: subprocess.Popen | None = None
         self._client: DelugeRPCClient | None = None
         self._lock = threading.Lock()
+        self._tunnel_lock = threading.Lock()
+        self._tunnel_host = ""
         self.boot_note = ""
 
     def close(self) -> None:
@@ -117,10 +120,12 @@ class Deluge:
 
     def ensure_tunnel(self) -> None:
         """Ensure SSH local forwards (Deluge + optional Torznab) are up."""
-        self._ensure_tunnel()
+        with self._tunnel_lock:
+            self._ensure_tunnel()
 
     def _connect(self) -> None:
-        self._ensure_tunnel()
+        with self._tunnel_lock:
+            self._ensure_tunnel()
         client = DelugeRPCClient(
             "127.0.0.1",
             self.config.ssh_local_port,
@@ -154,13 +159,35 @@ class Deluge:
         return True
 
     def _ensure_tunnel(self) -> None:
-        status = ensure_running(self.config.vm_name, self.config.ssh_host)
+        status = ensure_running(
+            self.config.vm_name,
+            self.address.current or self.address.configured,
+            address=self.address,
+        )
         if status == "started":
             self.boot_note = f"Started {self.config.vm_name}."
-        if self._process and self._process.poll() is None and self._forwards_ready():
+        host = self.address.current
+        if not host_pinned(host, self.config.ssh_known_hosts):
+            if not adopt_pinned_address(host, self.config.ssh_known_hosts):
+                raise DelugeError(
+                    "The VM address changed, and its SSH host key does not match the pinned key."
+                )
+            from plex_queue.securefs import protect_file
+
+            protect_file(self.config.ssh_known_hosts)
+        if (
+            self._process
+            and self._process.poll() is None
+            and self._forwards_ready()
+            and self._tunnel_host == host
+        ):
             return
         if self._process and self._process.poll() is None:
             self._process.terminate()
+            try:
+                self._process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
         key = self.config.ssh_key
         if not key.exists():
             raise DelugeError(
@@ -187,8 +214,9 @@ class Deluge:
                     f"127.0.0.1:{torznab.local_port}:127.0.0.1:{torznab.remote_port}",
                 ]
             )
-        command.append(f"{self.config.ssh_user}@{self.config.ssh_host}")
-        log.info("opening SSH tunnel to %s", self.config.ssh_host)
+        command.append(f"{self.config.ssh_user}@{host}")
+        log.info("opening SSH tunnel to %s", host)
+        self._tunnel_host = ""
         # DEVNULL for stderr: a PIPE without a reader can fill and hang ssh -N.
         # Failed starts still show up via poll() + missing local port.
         from plex_queue.winproc import popen
@@ -205,6 +233,7 @@ class Deluge:
                     "SSH to the VM failed. Install the plex-queue key for ttt, then try again."
                 )
             if self._forwards_ready():
+                self._tunnel_host = host
                 return
             time.sleep(0.2)
         if self._process.poll() is None:

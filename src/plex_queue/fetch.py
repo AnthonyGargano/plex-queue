@@ -6,6 +6,7 @@ import subprocess
 from pathlib import Path
 
 from plex_queue.sshutil import ssh_options
+from plex_queue.vm import GuestAddress
 
 
 class TransferError(RuntimeError):
@@ -85,10 +86,12 @@ class SshFetch:
         ssh: str | None = None,
         run=None,
         download_roots: tuple[str, ...] | list[str] | None = None,
+        address: GuestAddress | None = None,
     ):
         self.key = key
         self.user = user
         self.host = host
+        self.address = address
         self.known_hosts = known_hosts
         self.ssh = ssh or shutil.which("ssh") or r"C:\Windows\System32\OpenSSH\ssh.exe"
         if run is None:
@@ -98,11 +101,16 @@ class SshFetch:
         self.run = run
         self.download_roots = _roots_or_fail(download_roots)
 
+    def _host(self) -> str:
+        if self.address is not None and self.address.current:
+            return self.address.current
+        return self.host
+
     def fetch(self, remote: str, local: Path, size: int) -> None:
         local.parent.mkdir(parents=True, exist_ok=True)
         partial = local.with_name(local.name + ".part")
         command = cat_command(
-            self.ssh, self.key, self.user, self.host, remote, self.known_hosts,
+            self.ssh, self.key, self.user, self._host(), remote, self.known_hosts,
             self.download_roots,
         )
         try:
