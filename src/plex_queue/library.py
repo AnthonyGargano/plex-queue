@@ -143,6 +143,17 @@ class Library:
                 self._refresh_unlocked(True)
             return self._find_unlocked(request)
 
+    def find_if_loaded(self, request: Request) -> list[Copy]:
+        """Match against the index already in memory.
+
+        Unlike ``find``, this never starts a drive walk. Import uses it so a
+        concurrent ``invalidate()`` cannot turn a shelf lookup into a full scan.
+        """
+        with self._lock:
+            if not self.loaded:
+                return []
+            return self._find_unlocked(request)
+
     def _find_unlocked(self, request: Request) -> list[Copy]:
         if not request.tokens:
             return []

@@ -294,6 +294,113 @@ def bucket_of(path: Path | str, buckets: dict[str, tuple[Path, ...]]) -> str | N
     return None if best is None else best[0]
 
 
+_KIDS_SHELF = re.compile(r"\bkids\b|\bchildren\b", re.IGNORECASE)
+_CHRISTMAS_WORD = re.compile(r"\bchristmas\b", re.IGNORECASE)
+
+
+def shelf_hint(text: str, *, kind: str) -> str | None:
+    """Shelf implied by the title or release name, with no Plex genres.
+
+    Singular "kid" is ignored ("The Kid" is a movie). "Holiday" is ignored
+    ("Roman Holiday" is not a Christmas film). A "First Last: Special" title
+    is not treated as standup here; that guess needs genres and stays a tidy
+    proposal.
+    """
+    blob = text or ""
+    show = kind == "show"
+    if _STANDUP.search(blob):
+        return "standup"
+    if _ANIME.search(blob):
+        return "anime_shows" if show else "anime_movies"
+    if _KIDS_SHELF.search(blob):
+        return "kids_shows" if show else "kids_movies"
+    if not show and _CHRISTMAS_WORD.search(blob):
+        return "christmas"
+    if _DOC.search(blob):
+        return "documentary"
+    if _WORKOUT.search(blob):
+        return "workouts"
+    return None
+
+
+def import_dirs(
+    label: Label,
+    download_name: str = "",
+    *,
+    movie_dirs,
+    show_dirs,
+    buckets: dict[str, tuple[Path, ...]] | None = None,
+    library=None,
+    replace_path: str | None = None,
+) -> tuple[list[Path], str]:
+    """Destination roots for one finished download, and a short shelf name.
+
+    Order: the shelf of the file being replaced, then a shelf every existing
+    copy already shares, then an explicit word in the title or release name.
+    Otherwise the generic movie or show drives.
+    """
+    fallback = [Path(path) for path in (movie_dirs if label.kind == "movie" else show_dirs)]
+    fallback_name = "movie" if label.kind == "movie" else "show"
+    shelves = buckets or {}
+    shelf = _import_shelf(
+        label, download_name, shelves, library, replace_path,
+    )
+    roots = [Path(path) for path in (shelves.get(shelf) or ())] if shelf else []
+    if roots:
+        return roots, shelf.replace("_", " ")
+    return fallback, fallback_name
+
+
+def _import_shelf(label, download_name, buckets, library, replace_path) -> str | None:
+    if replace_path:
+        found = bucket_of(replace_path, buckets)
+        if found and (buckets.get(found) or ()):
+            return found
+    if library is not None and buckets:
+        if not getattr(library, "loaded", False):
+            # Plex index only. A full drive walk here would stall the import cycle.
+            try:
+                library.ensure_fresh(include_disk=False)
+            except (OSError, sqlite3.Error):
+                library = None
+        if library is not None and getattr(library, "loaded", False):
+            found = _shelf_from_library(label, library, buckets)
+            if found and (buckets.get(found) or ()):
+                return found
+    hint = shelf_hint(f"{label.title} {download_name}", kind=label.kind)
+    if hint and (buckets.get(hint) or ()):
+        return hint
+    return None
+
+
+def _shelf_from_library(label, library, buckets) -> str | None:
+    title = cleaned_title(label.title) or label.title
+    tokens = tuple(tokenize(title))
+    if not tokens:
+        return None
+    request = Request(
+        title,
+        tokens,
+        label.year if label.kind == "movie" else None,
+        None,
+        None,
+        label.kind,
+    )
+    try:
+        copies = library.find_if_loaded(request)
+    except (OSError, sqlite3.Error):
+        return None
+    found = []
+    for copy in copies:
+        name = bucket_of(copy.path, buckets)
+        if name:
+            found.append(name)
+    unique = set(found)
+    if len(unique) == 1:
+        return unique.pop()
+    return None
+
+
 def classify_copy(copy: Copy, genres: set[str] | None = None) -> str | None:
     """Return a bucket family hint: kids/anime/christmas/documentary/standup/workouts/movies/shows."""
     tags = {tag.lower() for tag in (genres or set())}

@@ -121,6 +121,7 @@ def main(argv: list[str] | None = None) -> None:
         min_height=config.min_height,
         library_roots=config.roots,
         booster=lambda: service.boost_stuck(only_when_added=True),
+        buckets=config.tidy_buckets,
     )
     app = build_application(config, service, access, importer, address)
     stop = threading.Event()

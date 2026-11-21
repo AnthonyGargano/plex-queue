@@ -312,7 +312,9 @@ def test_all_of_without_the_parses_show_title_cleanly():
 def test_bare_all_of_title_asks_movie_or_show():
     library = Library(None, [])
     library.loaded = True
-    result = Service(library, _Search([]), _Deluge()).request("all of ted lasso")
+    result = Service(library, _Search([]), _Deluge()).request(
+        "all of ted lasso", kind_lookup=lambda _query: None,
+    )
     assert isinstance(result, Clarify)
 
 
@@ -511,10 +513,42 @@ def test_a_bare_title_asks_movie_or_show_and_does_not_search():
         def search(self, query, match_as=None):
             raise AssertionError(query)
 
-    result = Service(library, Search(), _Deluge()).request("example story")
+    result = Service(library, Search(), _Deluge()).request(
+        "example story", kind_lookup=lambda _query: None,
+    )
     assert isinstance(result, Clarify)
     assert "IMDB" in result.text
     assert result.query == "example story"
+
+
+def test_a_clear_kind_lookup_skips_the_question():
+    library = Library(None, [])
+    library.loaded = True
+    library.copies = [movie("Example Story", 2019, 1080, r"J:\Movies2\Example Story.mkv")]
+
+    class Search:
+        def search(self, query, match_as=None):
+            raise AssertionError(query)
+
+    text = Service(library, Search(), _Deluge()).request(
+        "example story", kind_lookup=lambda _query: "movie",
+    )
+    assert "Check Plex" in text
+
+
+def test_infer_kind_uses_a_single_title_match_and_asks_when_both_exist():
+    from plex_queue.imdb import infer_kind
+
+    movie_row = {"l": "Inception", "qid": "movie", "y": 2010}
+    show_row = {"l": "The Office", "qid": "tvSeries", "y": 2005}
+    film_row = {"l": "The Office", "qid": "movie", "y": 2005}
+    assert infer_kind("inception", rows=[movie_row, show_row]) == "movie"
+    assert infer_kind("the office", rows=[show_row, film_row]) is None
+    assert infer_kind("dune 1984", rows=[
+        {"l": "Dune", "qid": "movie", "y": 2021},
+        {"l": "Dune", "qid": "movie", "y": 1984},
+    ]) == "movie"
+    assert infer_kind("not a real title", rows=[]) is None
 
 
 def test_service_queues_when_the_library_copy_is_below_1080():

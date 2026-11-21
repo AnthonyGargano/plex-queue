@@ -57,6 +57,7 @@ class Importer:
         min_height: int = 1080,
         library_roots=None,
         booster=None,
+        buckets=None,
     ):
         self.deluge = deluge
         self.ledger = ledger
@@ -74,6 +75,10 @@ class Importer:
         self.plex_db = Path(plex_db) if plex_db else None
         self.min_height = min_height
         self.library_roots = tuple(Path(root) for root in (library_roots or ()))
+        self.buckets = {
+            str(name): tuple(Path(path) for path in (roots or ()))
+            for name, roots in (buckets or {}).items()
+        }
         # Optional callable() -> str for stuck-torrent auto-boost at cycle end.
         self.booster = booster
         if download_roots is None:
@@ -246,7 +251,17 @@ class Importer:
                 f"Reply: movie {download.hash[:6]}\n"
                 f"or: show {download.hash[:6]}",
             ), []
-        roots = self.movie_dirs if label.kind == "movie" else self.show_dirs
+        from plex_queue.tidy import import_dirs
+
+        roots, place_name = import_dirs(
+            label,
+            download.name,
+            movie_dirs=self.movie_dirs,
+            show_dirs=self.show_dirs,
+            buckets=self.buckets,
+            library=self.library,
+            replace_path=state.get("replace_path"),
+        )
         if not roots:
             return self._once(download.hash, "needs_detail", f"No {label.kind} folders are configured."), []
         probe_root = Path(roots[0])
@@ -261,7 +276,7 @@ class Importer:
                 download.hash,
                 "waiting_space",
                 f"{label.title} is ready ({gb(needed)}). "
-                f"No {label.kind} drive has room for it with {gb(self.margin)} left over.\n"
+                f"No {place_name} drive has room for it with {gb(self.margin)} left over.\n"
                 f"{listed}\nLeft it on the VM.",
             ), []
         if report.root != probe_root:

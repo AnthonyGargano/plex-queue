@@ -22,6 +22,7 @@ from plex_queue.access import Access
 from plex_queue.config import Config
 from plex_queue.deluge_remote import DelugeError
 from plex_queue.errors import public_error
+from plex_queue.imdb import infer_kind
 from plex_queue.service import Clarify, Service
 from plex_queue.titles import (
     all_of_me_title,
@@ -36,7 +37,7 @@ log = logging.getLogger(__name__)
 HELP = """\
 Send a title, or an IMDB link such as https://www.imdb.com/title/tt0133093/
 
-A link tells me the exact movie or show. A bare title asks you to pick movie or TV show before I check Plex. Saying TV show (or all/every seasons) fills missing seasons. A season or episode, like S01 or S01E03, queues that season only.
+A link tells me the exact movie or show. A bare title is looked up; I ask movie or TV show only when it could be either. Saying TV show (or all/every seasons) fills missing seasons. A season or episode, like S01 or S01E03, queues that season only.
 
 /active  downloads in progress
 /queue   waiting, paused, and checking
@@ -52,7 +53,7 @@ A copy at 1080p or higher gets a reply to check Plex. Widescreen files count as 
 A lower copy queues a higher-quality one when a release exists.
 A title you don't have is queued.
 
-Finished downloads are copied to the movie or show drive with enough free space, removed from the VM, and Plex is scanned.
+Finished downloads land on the shelf that title already uses (kids, documentary, standup, and the others) when that is clear, otherwise on the movie or show drive with enough free space. The VM copy is removed and Plex is scanned.
 After Plex is serving the new higher-quality file, the owner can /upgrades and /drop the old copy to the Recycle Bin (not hard-deleted).
 """
 
@@ -486,12 +487,22 @@ def build_application(
         if not await allowed(update):
             return
         uid = user_id(update) or 0
-        if _needs_choice(query, kind):
-            pending[uid] = query.strip()
-            await reply(update, _clarify_text(query), CHOOSE)
-            return
         is_owner = access.is_owner(uid)
         limit = 30 if is_owner else config.guest_hourly_limit
+        spent = 0
+        if _needs_choice(query, kind):
+            # Charge before the IMDB lookup, including titles we still have to ask about.
+            if not limiter.allow(uid, limit, cost=1):
+                await reply(update, "Too many requests this hour. Try again later.")
+                return
+            spent = 1
+            inferred = await _work(lambda: infer_kind(query))
+            if inferred in {"movie", "show"}:
+                kind = inferred
+            else:
+                pending[uid] = query.strip()
+                await reply(update, _clarify_text(query), CHOOSE)
+                return
         # Collection / "all seasons" sweeps fan out many nested lookups; charge more.
         # Guests: one collection sweep per hour at the default limit of 5.
         # Picking "TV show" on a bare title also fills all seasons.
@@ -511,7 +522,7 @@ def build_application(
             cost = 10 if is_owner else limit
         else:
             cost = 1
-        if not limiter.allow(uid, limit, cost=cost):
+        if cost > spent and not limiter.allow(uid, limit, cost=cost - spent):
             await reply(update, "Too many requests this hour. Try again later.")
             return
         await reply(update, "Checking the library...")
@@ -627,7 +638,7 @@ def _clarify_text(query: str) -> str:
     if len(shown) > 80:
         shown = shown[:77] + "..."
     return (
-        f'Is "{shown}" a movie or a TV show?\n'
+        f'I couldn\'t tell whether "{shown}" is a movie or a TV show.\n'
         "An IMDB link is the surest way. Paste one, such as "
         "https://www.imdb.com/title/tt0133093/"
     )

@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 import threading
+import urllib.error
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -24,7 +25,7 @@ from plex_queue.boost import (
 )
 from plex_queue.decide import AlreadyHave, Enqueue, NoUpgrade, NothingFound, UnknownQuality, decide
 from plex_queue.errors import public_error
-from plex_queue.imdb import Identity, fetch_collection, fetch_imdb
+from plex_queue.imdb import Identity, fetch_collection, fetch_imdb, infer_kind
 from plex_queue.library import fill_heights
 from plex_queue.models import Copy, Torrent, bucket, torrent_line
 from plex_queue.place import Label, cleaned_title, is_complete, under_roots
@@ -133,6 +134,7 @@ class Service:
     def request(
         self, query: str, kind: str | None = None, resolver=None,
         collection_resolver=None, brief: bool = False, as_guest: bool = False,
+        kind_lookup=None,
     ) -> str | Clarify:
         display = cleaned_title(query)
         parsed = parse_request(query)
@@ -147,27 +149,36 @@ class Service:
                 )
             display = identity.title or display
             parsed = _from_identity(query, identity)
-        elif kind in {"movie", "show"}:
-            collection = parsed.collection
-            franchise = parsed.franchise
-            # Picking "TV show" without a season means fill the whole series —
-            # do not ask again for "all" / S01.
-            title = " ".join(
-                str(display or " ".join(parsed.tokens)).split()
-            )
-            if (
-                kind == "show"
-                and parsed.season is None
-                and parsed.episode is None
-                and not collection
-            ):
-                collection = True
-                franchise = franchise or title or None
-            parsed = Request(
-                parsed.raw, parsed.tokens, parsed.year, parsed.season,
-                parsed.episode, kind, parsed.imdb_id, collection,
-                franchise, parsed.collection_limit,
-            )
+        else:
+            if kind not in {"movie", "show"} and parsed.kind not in {"movie", "show"}:
+                lookup = kind_lookup if kind_lookup is not None else infer_kind
+                try:
+                    inferred = lookup(query)
+                except (OSError, urllib.error.URLError, TimeoutError):
+                    inferred = None
+                if inferred in {"movie", "show"}:
+                    kind = inferred
+            if kind in {"movie", "show"}:
+                collection = parsed.collection
+                franchise = parsed.franchise
+                # Picking "TV show" without a season means fill the whole series —
+                # do not ask again for "all" / S01.
+                title = " ".join(
+                    str(display or " ".join(parsed.tokens)).split()
+                )
+                if (
+                    kind == "show"
+                    and parsed.season is None
+                    and parsed.episode is None
+                    and not collection
+                ):
+                    collection = True
+                    franchise = franchise or title or None
+                parsed = Request(
+                    parsed.raw, parsed.tokens, parsed.year, parsed.season,
+                    parsed.episode, kind, parsed.imdb_id, collection,
+                    franchise, parsed.collection_limit,
+                )
         # Known films never season-fill, even after kind / pack cues.
         title = " ".join(str(display or " ".join(parsed.tokens)).split())
         me = all_of_me_title(title)
@@ -1547,7 +1558,7 @@ def _clarify(query: str) -> Clarify:
         shown = shown[:77] + "..."
     return Clarify(
         query.strip(),
-        f'Is "{shown}" a movie or a TV show?\n'
+        f'I couldn\'t tell whether "{shown}" is a movie or a TV show.\n'
         "An IMDB link is the surest way. Paste one, such as "
         "https://www.imdb.com/title/tt0133093/",
     )

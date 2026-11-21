@@ -7,7 +7,7 @@ from plex_queue.importer import Importer, _retire_conflicting, send_telegram
 from plex_queue.ledger import Ledger
 from plex_queue.place import CopyJob
 from plex_queue.library import Library
-from plex_queue.models import Hit, Torrent
+from plex_queue.models import Copy, Hit, Torrent
 from plex_queue.place import (
     Download,
     Label,
@@ -25,6 +25,87 @@ from plex_queue.place import (
 )
 from plex_queue.plexscan import refresh_section, section_id
 from plex_queue.service import Service
+
+
+def test_import_puts_a_named_documentary_on_that_shelf(tmp_path):
+    movies = tmp_path / "Movies"
+    docs = tmp_path / "Documentary"
+    movies.mkdir()
+    docs.mkdir()
+    digest = "ee" * 20
+    download = Download(digest, "Planet.Earth.A.Documentary.2019.mkv", "/home/ttt/Downloads", (
+        RemoteFile("Planet.Earth.A.Documentary.2019.mkv", 5),
+    ))
+    transport = _Transport({"/home/ttt/Downloads/Planet.Earth.A.Documentary.2019.mkv": b"hello"})
+    importer = _importer(
+        tmp_path, _Deluge([download], {digest}), transport, _Plex(),
+        [movies], None, free=100 * 1024 ** 3,
+    )
+    importer.buckets = {"movies": (movies,), "documentary": (docs,)}
+    importer.ledger.remember(digest, Label("movie", "Planet Earth", 2019))
+    importer.cycle(notify=False)
+    assert (docs / "Planet Earth (2019)" / "Planet.Earth.A.Documentary.2019.mkv").read_bytes() == b"hello"
+    assert not (movies / "Planet Earth (2019)").exists()
+
+
+def test_import_follows_the_shelf_an_existing_show_already_uses(tmp_path):
+    shows = tmp_path / "Shows"
+    kids = tmp_path / "Kids Shows"
+    shows.mkdir()
+    kids.mkdir()
+    digest = "ff" * 20
+    download = Download(digest, "Bluey.S02E01.mkv", "/home/ttt/Downloads", (
+        RemoteFile("Bluey.S02E01.mkv", 5),
+    ))
+    transport = _Transport({"/home/ttt/Downloads/Bluey.S02E01.mkv": b"hello"})
+    library = Library(None, [shows, kids])
+    library.loaded = True
+    library.copies = [
+        Copy(
+            "episode", "E1", None, "Bluey", 1, 1, 1080,
+            str(kids / "Bluey" / "Season 01" / "Bluey.S01E01.mkv"),
+        ),
+    ]
+    importer = _importer(
+        tmp_path, _Deluge([download], {digest}), transport, _Plex(),
+        [shows], library, free=100 * 1024 ** 3,
+    )
+    importer.show_dirs = [shows]
+    importer.buckets = {"shows": (shows,), "kids_shows": (kids,)}
+    importer.ledger.remember(digest, Label("show", "Bluey", season=2))
+    importer.cycle(notify=False)
+    assert (kids / "Bluey" / "Season 02" / "Bluey.S02E01.mkv").read_bytes() == b"hello"
+    assert not (shows / "Bluey").exists()
+
+
+def test_import_leaves_an_ordinary_movie_on_the_movie_drives(tmp_path):
+    movies = tmp_path / "Movies"
+    docs = tmp_path / "Documentary"
+    movies.mkdir()
+    docs.mkdir()
+    digest = "ab" * 20
+    download = Download(digest, "Example.Story.2019.mkv", "/home/ttt/Downloads", (
+        RemoteFile("Example.Story.2019.mkv", 5),
+    ))
+    transport = _Transport({"/home/ttt/Downloads/Example.Story.2019.mkv": b"hello"})
+    importer = _importer(
+        tmp_path, _Deluge([download], {digest}), transport, _Plex(),
+        [movies], None, free=100 * 1024 ** 3,
+    )
+    importer.buckets = {"movies": (movies,), "documentary": (docs,)}
+    importer.ledger.remember(digest, Label("movie", "Example Story", 2019))
+    importer.cycle(notify=False)
+    assert (movies / "Example Story (2019)" / "Example.Story.2019.mkv").is_file()
+    assert not (docs / "Example Story (2019)").exists()
+
+
+def test_shelf_hint_ignores_the_kid_and_roman_holiday():
+    from plex_queue.tidy import shelf_hint
+
+    assert shelf_hint("The Kid 2010", kind="movie") is None
+    assert shelf_hint("Roman Holiday 1953", kind="movie") is None
+    assert shelf_hint("Kids", kind="show") == "kids_shows"
+    assert shelf_hint("Planet Earth documentary", kind="movie") == "documentary"
 
 
 def test_general_dirs_skip_special_libraries():

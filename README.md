@@ -2,7 +2,7 @@
 
 A Telegram bot on this PC. It reads the Plex library and the video drives, then talks to Deluge on the Ubuntu VM over an SSH tunnel. If UbuntuClean is off, the bot starts it and waits until SSH answers. The VM SSH host key is pinned in `data/ssh_known_hosts`; a changed key is refused. `/claim` is limited to a few attempts per hour, and `/deny` clears that person's pending title choice.
 
-Send a title in Telegram. A bare title asks whether it is a movie or a TV show before anything is queued. An IMDB link, such as `https://www.imdb.com/title/tt0133093/`, names the exact title and skips that question. A season or episode code is treated as a show.
+Send a title in Telegram. A bare title is looked up on IMDB; you are asked movie or TV show only when the title is both, or the lookup is unsure. An IMDB link, such as `https://www.imdb.com/title/tt0133093/`, names the exact title and skips that question. A season or episode code is treated as a show.
 
 - If a copy is already 1080p or higher, the bot tells you to check Plex and does not queue anything. A widescreen 1080p file is often stored as 1920x800; that still counts as 1080p.
 - "All of the Clerks movies", or a trilogy, looks up each movie. Anything already at 1080p is left alone. A missing movie, or one below 1080p, is queued by itself. The summary says how many were covered, queued, or left unfilled. Sets whose titles do not share a prefix (Dark Knight, Cornetto) use a built-in member list.
@@ -10,7 +10,7 @@ Send a title in Telegram. A bare title asks whether it is a movie or a TV show b
 - If the copy on disk is below 1080p, and a 1080p or 4K release exists, that release is queued.
 - If you don't have it, it is queued. A 1080p release is preferred when one is available.
 - `/active`, `/queue`, and `/done` show Deluge. The owner can `/rm` a torrent.
-- Every 10 minutes, while the VM is already on, finished downloads are copied to the movie or show drive with enough free space (2 GB left over). The copy on the VM is then removed, and Plex scans the new folder. Kids, anime, documentary, and the other special libraries are left alone. Change the `import:` folders in `config.yaml` to pick different drives. File paths that climb out of the download folder, or that would write outside the chosen library root, are refused.
+- Every 10 minutes, while the VM is already on, finished downloads are copied onto the shelf that title already lives on (kids, anime, documentary, standup, and the others), or onto that shelf when the release name says so. Otherwise they go to the movie or show drive with enough free space (2 GB left over). The copy on the VM is then removed, and Plex scans the new folder. Change the `import:` folders in `config.yaml` to pick the generic drives. File paths that climb out of the download folder, or that would write outside the chosen library root, are refused.
 - After Plex is serving a higher-quality upgrade, the owner can `/upgrades` and `/drop` the old copy to the Recycle Bin (not hard-deleted).
 - Structured JSON events are logged on the `plex_queue.events` logger (`tidy.audit`, `tidy.apply`, `plex.refresh_all`, `import.cycle`, `upgrade.drop`, …). With `otel.enabled: true` and `pip install -e ".[otel]"`, those events (plus traces/metrics) export over OTLP to the local stack in [`observability/`](observability/) (Collector → Kafka + Prometheus/Loki/Tempo → Grafana).
 

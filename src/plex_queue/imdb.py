@@ -145,6 +145,49 @@ def collection_from_rows(name: str, rows: list[dict]) -> list[Identity]:
     return found
 
 
+def infer_kind(text: str, timeout: int = 20, rows: list[dict] | None = None) -> str | None:
+    """Movie or show when IMDB has one clear title match.
+
+    Returns None when the title is both a movie and a show, nothing matches,
+    or the suggestion service cannot be reached. Callers then ask the user.
+    """
+    from plex_queue.titles import is_year, parse_request, phrase_match, tokenize
+
+    parsed = parse_request(text)
+    if parsed.kind in {"movie", "show"}:
+        return parsed.kind
+    tokens = [token for token in parsed.tokens if not is_year(token)]
+    if len("".join(tokens)) < 3:
+        return None
+    if rows is None:
+        try:
+            rows = suggest_rows(" ".join(tokens), timeout=timeout)
+        except (OSError, urllib.error.URLError, TimeoutError):
+            return None
+    matches: list[tuple[bool, str]] = []
+    for row in rows:
+        title = str(row.get("l") or "").strip()
+        kind = _kind(row)
+        if not title or not kind:
+            continue
+        title_tokens = tokenize(title)
+        if not phrase_match(tokens, title_tokens):
+            continue
+        year = _year(row.get("y"))
+        if parsed.year and year and year != parsed.year:
+            continue
+        title_words = [token for token in title_tokens if not is_year(token)]
+        matches.append((title_words == tokens, kind))
+    if not matches:
+        return None
+    exact = [kind for is_exact, kind in matches if is_exact]
+    pool = exact or [kind for _exact, kind in matches]
+    kinds = set(pool)
+    if len(kinds) == 1:
+        return pool[0]
+    return None
+
+
 def fetch_imdb(imdb_id: str, timeout: int = 20) -> Identity | None:
     wanted = imdb_id.lower()
     cached = _IMDB_CACHE.get(wanted)

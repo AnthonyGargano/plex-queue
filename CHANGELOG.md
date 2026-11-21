@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Bare titles are looked up on IMDB and treated as a movie or show when the match is unambiguous.
+- Import copies onto an existing special shelf (kids, documentary, standup, and the others), or onto that shelf when the release name says so. Otherwise the generic movie or show drives.
 - Batch `/tidy apply` (and `/tidy orphans`) lists each done/failed action; `/tidy last` re-shows that report.
 
 ## 0.1.0
